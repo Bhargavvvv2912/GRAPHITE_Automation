@@ -9,7 +9,7 @@ tqdm==4.67.1
 scipy==1.16.2
 torch==2.8.0
 kornia==0.8.1
-Pillow
+Pillow==11.3.0
 python_Levenshtein
 requests
 pyyaml
