@@ -5,7 +5,7 @@ opencv_python==4.12.0.88
 pandas==2.3.2
 torchvision==0.23.0
 joblib==1.5.2
-tqdm
+tqdm==4.67.1
 scipy
 torch
 kornia
