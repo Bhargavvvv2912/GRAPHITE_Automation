@@ -3,7 +3,7 @@ numpy==2.3.3
 prettytable==3.16.0
 opencv_python==4.12.0.88
 pandas==2.3.2
-torchvision
+torchvision==0.23.0
 joblib
 tqdm
 scipy
