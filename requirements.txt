@@ -1,5 +1,5 @@
 matplotlib==3.10.6
-numpy
+numpy==2.3.3
 prettytable
 opencv_python
 pandas
