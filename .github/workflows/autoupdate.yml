@@ -28,7 +28,7 @@ jobs:
       - name: Run update agent
         run: |
           python3 Agent/check_updates.py
-          python3 Agent/run_update.py
+          python3 -m Agent.run_update
 
       - name: Commit and push changes
         run: |
