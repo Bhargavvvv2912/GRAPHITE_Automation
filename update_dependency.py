@@ -7,6 +7,11 @@ import ast
 import shutil
 import re
 
+# This is the line that was missing
+import google.generativeai as genai
+
+from pypi_simple import PyPISimple
+
 # --- Configuration ---
 REQUIREMENTS_FILE = "requirements.txt"
 METRICS_OUTPUT_FILE = "metrics_output.txt"
@@ -115,9 +120,9 @@ class DependencyAgent:
     def run(self):
         """Main execution loop for the agent."""
         if os.path.exists(METRICS_OUTPUT_FILE): os.remove(METRICS_OUTPUT_FILE)
-        is_pinned, lines = self.get_requirements_state()
+        is_pinned, lines = self._get_requirements_state()
         if not is_pinned:
-            self.bootstrap_unpinned_requirements()
+            self._bootstrap_unpinned_requirements()
             return
 
         original_requirements = {line.split('==')[0]: line.split('==')[1] for line in lines}
@@ -172,13 +177,11 @@ class DependencyAgent:
             print(f"Validation failed for the update of {package_to_update}. Reverting.", file=sys.stderr)
             return
 
-        # <<< --- THIS IS THE NEW LOGGING BLOCK --- >>>
         print("\n" + "*"*60)
         print(f"** SUCCESS: {package_to_update} was updated to {new_version} and passed validation. **")
         indented_metrics = "\n".join([f"  {line}" for line in metrics.split('\n')])
         print(indented_metrics)
         print("*"*60 + "\n")
-        # <<< --- END OF NEW LOGGING BLOCK --- >>>
 
         print(f"Freezing new state to {self.requirements_path}...")
         installed_packages, _, _ = run_command([python_executable, "-m", "pip", "freeze"])
@@ -187,14 +190,35 @@ class DependencyAgent:
 
     def resolve_conflict_with_llm(self, error_message, requirements_list):
         """Uses Gemini to find a set of compatible package versions."""
-        # This function remains unchanged from the previous version
         py_version = f"{sys.version_info.major}.{sys.version_info.minor}"
         original_packages = {req.split('==')[0] for req in requirements_list}
-        prompt = "..." # (Full prompt from before)
+        prompt = f"""
+        I am an automated script trying to resolve a Python dependency conflict for a project running on Python {py_version}. My attempt to install the following packages failed:
+        {requirements_list}
+
+        The exact error message from pip was:
+        ---
+        {error_message}
+        ---
+        Your task is to provide a new, corrected list of packages that resolves this conflict.
+        Constraints:
+        1. The new list MUST be compatible with Python {py_version}.
+        2. The new list MUST include every package from the original list. Do not omit any.
+        3. Your response MUST be ONLY a Python list of strings in the format 'package_name==version'.
+        Example response: ['numpy==1.26.4', 'pandas==2.2.0', 'scipy==1.11.4']
+        """
         try:
-            # (Full logic from before)
-            return # solution_list or None
-        except Exception:
+            response = llm.generate_content(prompt)
+            response_text = response.text.strip()
+            if response_text.startswith("```python"):
+                response_text = response_text.strip("```python\n").strip("```")
+            solution_list = ast.literal_eval(response_text)
+            if not isinstance(solution_list, list): return None
+            solution_packages = {req.split('==') for req in solution_list}
+            if original_packages != solution_packages: return None
+            return solution_list
+        except Exception as e:
+            print(f"Error parsing LLM response or communicating with API: {e}", file=sys.stderr)
             return None
 
 if __name__ == "__main__":
