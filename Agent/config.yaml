@@ -1,0 +1,46 @@
+# agent/config.yaml
+
+# List of dependencies we want to track (from requirements.txt)
+dependencies:
+  - matplotlib
+  - numpy
+  - prettytable
+  - opencv_python
+  - pandas
+  - torchvision
+  - joblib
+  - tqdm
+  - scipy
+  - torch
+  - kornia
+  - Pillow
+  - python_Levenshtein
+
+# Baseline test commands to validate after an update
+# These will be executed in sequence.
+test_commands:
+  - "./make_output_folders.sh"
+  - "python3 main.py -v 14 -t 1 --tr_lo 0.65 --tr_hi 0.85 -s score.py -n GTSRB --heatmap=Target --coarse_mode=binary -b 100 -m 100"
+
+# Log parsing rules - what values to extract from console output
+# We will regex these later in ci_runner.py
+metrics:
+  transform_robustness: "Final transform_robustness: ([0-9\\.]+)"
+  num_pixels: "Final number of pixels: ([0-9]+)"
+  num_queries: "Final number of queries: ([0-9]+)"
+
+# Branch where autonomous commits should be made
+target_branch: "autoupdate"
+
+# Commit message template
+commit_message: "Auto-update {package} {old_version} → {new_version}"
+
+# How often to check for updates (GitHub Actions will use this)
+schedule: "every 3 days"
+
+# LLM configuration for changelog summarization
+llm:
+  provider: "openai"
+  model: "gpt-5"
+  temperature: 0.2
+  max_tokens: 500
