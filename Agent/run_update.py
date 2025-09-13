@@ -10,7 +10,6 @@ OUTDATED_FILE = "outdated.txt"
 LOGS_DIR = "logs"
 METRICS_FILE = os.path.join(LOGS_DIR, "metrics.json")
 
-# ---------------- utilities ----------------
 
 def read_outdated():
     """Read all outdated packages from outdated.txt"""
@@ -97,8 +96,6 @@ def git_commit(msg):
     run_command("git add requirements.lock logs/")
     run_command(f'git commit -m "{msg}"')
 
-# ---------------- bulk + fallback logic ----------------
-
 def bulk_update(outdated_list):
     """Try to update all packages in one go"""
     for pkg, _, new in outdated_list:
@@ -116,7 +113,6 @@ def main():
     for pkg, old, new in outdated_list:
         summaries[pkg] = summarize_changes(pkg, old, new, repo_path=".")
 
-    # ---------- Bulk update ----------
     print(f" Attempting bulk update for {len(outdated_list)} packages...")
     code, _ = bulk_update(outdated_list)
     if code == 0:
@@ -131,7 +127,7 @@ def main():
         else:
             print(" Bulk update failed → falling back to per-package updates.")
 
-    # ---------- Fallback per-package ----------
+    print(" Proceeding with individual package updates...")
     for pkg, old, new in outdated_list:
         print(f" Updating {pkg}: {old} → {new}")
 
