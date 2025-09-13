@@ -1,6 +1,6 @@
 matplotlib==3.10.6
 numpy==2.3.3
-prettytable
+prettytable==3.16.0
 opencv_python
 pandas
 torch
