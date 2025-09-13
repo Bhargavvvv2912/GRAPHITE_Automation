@@ -1,46 +1,47 @@
 name: Autonomous Dependency Updater
 
 on:
-  # Runs on a schedule (every 3 days)
+  workflow_dispatch:
   schedule:
     - cron: '0 0 */3 * *'
-  # Allows you to run this workflow manually from the Actions tab
-  workflow_dispatch:
 
 jobs:
-  # JOB 1: UPDATE THE DEPENDENCIES ON THE BASELINE PYTHON VERSION
   update-dependencies:
     runs-on: ubuntu-latest
-    strategy:
-      # This job runs on the primary/oldest Python version you want to support.
-      # This provides a stable environment for dependency resolution.
-      matrix:
-        python-version: ['3.9'] 
     
+    # This 'defaults' block ensures all 'run' commands execute in the root of the workspace.
+    defaults:
+      run:
+        working-directory: ${{ github.workspace }}
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Python ${{ matrix.python-version }}
+      - name: Debug - Verify File Path
+        run: |
+          echo "Current directory: $(pwd)"
+          echo "Workspace content:"
+          ls -R
+
+      - name: Set up Python 3.9
         uses: actions/setup-python@v5
         with:
-          python-version: ${{ matrix.python-version }}
+          python-version: '3.9'
 
       - name: Install agent dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install google-generativeai pypi-simple
+        run: pip install google-generativeai pypi-simple
 
-      - name: Run the Autonomous Agent to update requirements.txt
+      - name: Run the Autonomous Agent
         run: python dependency_agent.py
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-
+      
       - name: Commit and push changes if any
         run: |
+          # The logic to commit and push remains the same
           git config --global user.name 'Dependency Agent'
           git config --global user.email 'agent@users.noreply.github.com'
-          # Only commit and push if the requirements.txt file was actually changed
           if ! git diff --quiet requirements.txt; then
             echo "Dependencies updated. Committing changes."
             git add requirements.txt
@@ -50,13 +51,13 @@ jobs:
             echo "No dependency changes to commit."
           fi
 
-  # JOB 2: VALIDATE THE NEW DEPENDENCIES ON NEWER PYTHON VERSIONS
   validate-on-other-versions:
-    # This job only runs if the main 'update-dependencies' job was successful
     needs: update-dependencies
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ github.workspace }}
     strategy:
-      # This matrix tests forward-compatibility against newer Python versions
       matrix:
         python-version: ['3.10', '3.11', '3.12']
     
@@ -69,14 +70,10 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
-      - name: Install the newly updated dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
+      - name: Install updated dependencies
+        run: pip install -r requirements.txt
 
-      - name: Run validation script on Python ${{ matrix.python-version }}
+      - name: Run validation on Python ${{ matrix.python-version }}
         run: |
-          echo "--- Running Validation Step 1: Creating output folders ---"
           bash ./make_output_folders.sh
-          echo "--- Running Validation Step 2: Executing main attack script ---"
           python3 main.py -v 14 -t 1 --tr_lo 0.65 --tr_hi 0.85 -s score.py -n GTSRB --heatmap=Target --coarse_mode=binary -b 100 -m 100
