@@ -1,22 +1,23 @@
-mkdir outputs;
-mkdir outputs/boosted;
-mkdir outputs/heatmaps;
-mkdir outputs/inits;
-mkdir outputs/masks;
-mkdir outputs/perturbations;
-mkdir outputs/whitebox;
+#!/bin/bash
+mkdir -p outputs
+mkdir -p outputs/boosted
+mkdir -p outputs/heatmaps
+mkdir -p outputs/inits
+mkdir -p outputs/masks
+mkdir -p outputs/perturbations
+mkdir -p outputs/whitebox
 
-mkdir outputs/OpenALPRBorder;
-mkdir outputs/OpenALPRBorder/boosted;
-mkdir outputs/OpenALPRBorder/heatmaps;
-mkdir outputs/OpenALPRBorder/inits;
-mkdir outputs/OpenALPRBorder/masks;
-mkdir outputs/OpenALPRBorder/perturbations;
+mkdir -p outputs/OpenALPRBorder
+mkdir -p outputs/OpenALPRBorder/boosted
+mkdir -p outputs/OpenALPRBorder/heatmaps
+mkdir -p outputs/OpenALPRBorder/inits
+mkdir -p outputs/OpenALPRBorder/masks
+mkdir -p outputs/OpenALPRBorder/perturbations
 
-mkdir outputs/CIFAR;
-mkdir outputs/CIFAR/boosted;
-mkdir outputs/CIFAR/heatmaps;
-mkdir outputs/CIFAR/inits;
-mkdir outputs/CIFAR/logs;
-mkdir outputs/CIFAR/masks;
-mkdir outputs/CIFAR/perturbations;
+mkdir -p outputs/CIFAR
+mkdir -p outputs/CIFAR/boosted
+mkdir -p outputs/CIFAR/heatmaps
+mkdir -p outputs/CIFAR/inits
+mkdir -p outputs/CIFAR/logs
+mkdir -p outputs/CIFAR/masks
+mkdir -p outputs/CIFAR/perturbations

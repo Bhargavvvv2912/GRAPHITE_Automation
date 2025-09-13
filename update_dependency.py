@@ -189,7 +189,6 @@ class DependencyAgent:
         with open(METRICS_OUTPUT_FILE, "w") as f: f.write(metrics)
 
     def resolve_conflict_with_llm(self, error_message, requirements_list):
-        """Uses Gemini to find a set of compatible package versions."""
         py_version = f"{sys.version_info.major}.{sys.version_info.minor}"
         original_packages = {req.split('==')[0] for req in requirements_list}
         prompt = f"""
@@ -208,14 +207,30 @@ class DependencyAgent:
         Example response: ['numpy==1.26.4', 'pandas==2.2.0', 'scipy==1.11.4']
         """
         try:
+            print(f"Sending prompt to LLM for conflict resolution (context: Python {py_version})...")
             response = llm.generate_content(prompt)
             response_text = response.text.strip()
-            if response_text.startswith("```python"):
-                response_text = response_text.strip("```python\n").strip("```")
-            solution_list = ast.literal_eval(response_text)
-            if not isinstance(solution_list, list): return None
-            solution_packages = {req.split('==') for req in solution_list}
-            if original_packages != solution_packages: return None
+            
+            # Use regex to find the list within the text, making it robust to extra text from the LLM.
+            match = re.search(r'(\[.*?\])', response_text, re.DOTALL)
+            if not match:
+                print(f"LLM Error: Could not find a list in the response text.", file=sys.stderr)
+                return None
+
+            list_string = match.group(1)
+            solution_list = ast.literal_eval(list_string)
+
+            if not isinstance(solution_list, list):
+                print(f"LLM Error: Parsed structure was not a list.", file=sys.stderr)
+                return None
+            
+            # Verify the solution contains the same packages
+            solution_packages = {req.split('==')[0] for req in solution_list}
+            if original_packages != solution_packages:
+                print(f"LLM Error: Solution did not contain the correct set of packages.", file=sys.stderr)
+                return None
+            
+            print("LLM provided a valid and verified solution.")
             return solution_list
         except Exception as e:
             print(f"Error parsing LLM response or communicating with API: {e}", file=sys.stderr)
