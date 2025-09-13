@@ -93,14 +93,14 @@ def git_commit(pkg, old, new):
 def main():
     outdated = read_outdated()
     if not outdated:
-        print("✅ No outdated dependencies left")
+        print(" No outdated dependencies left")
         return
     pkg, old, new = outdated
-    print(f"🔄 Updating {pkg}: {old} → {new}")
+    print(f" Updating {pkg}: {old} → {new}")
 
-    # 🧠 Call LLM with repo context (imports + relevant files)
+    #  Call LLM with repo context (imports + relevant files)
     llm_summary = summarize_changes(pkg, old, new, repo_path=".")
-    print(f"🧠 LLM Summary for {pkg}:\n{llm_summary}")
+    print(f"LLM Summary for {pkg}:\n{llm_summary}")
 
     # Update lock file
     update_lock(pkg, new)
@@ -108,7 +108,7 @@ def main():
     # Install new version
     code, _ = run_command(f"pip install {pkg}=={new}")
     if code != 0:
-        print(f"❌ Failed to install {pkg}=={new}, reverting")
+        print(f" Failed to install {pkg}=={new}, reverting")
         update_lock(pkg, old)
         return
 
@@ -116,11 +116,11 @@ def main():
     success, output = run_tests()
     if success:
         metrics = parse_metrics(output)
-        print(f"✅ Tests passed with {pkg}=={new}, metrics={metrics}")
+        print(f" Tests passed with {pkg}=={new}, metrics={metrics}")
         save_metrics(pkg, old, new, metrics, llm_summary)
         git_commit(pkg, old, new)
     else:
-        print(f"❌ Tests failed with {pkg}=={new}, reverting")
+        print(f" Tests failed with {pkg}=={new}, reverting")
         update_lock(pkg, old)
         run_command(f"pip install {pkg}=={old}")
 

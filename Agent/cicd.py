@@ -8,7 +8,7 @@ OUTDATED_FILE = "outdated.txt"
 
 def run_check_updates():
     """Run the script that checks for outdated packages"""
-    code = subprocess.run("python3 agent/check_updates.py", shell=True)
+    code = subprocess.run("python3 Agent/check_updates.py", shell=True)
     return code.returncode == 0
 
 def read_outdated_list():
