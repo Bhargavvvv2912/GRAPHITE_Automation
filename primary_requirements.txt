@@ -1,6 +1,6 @@
 # primary_requirements.txt
 matplotlib
-numpy
+numpy<2.0
 prettytable
 opencv-python
 pandas

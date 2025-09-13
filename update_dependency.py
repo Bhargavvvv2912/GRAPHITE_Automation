@@ -6,10 +6,8 @@ from pathlib import Path
 import ast
 import shutil
 import re
-
-# This is the line that was missing
 import google.generativeai as genai
-
+from google.api_core.exceptions import ResourceExhausted
 from pypi_simple import PyPISimple
 
 # --- Configuration ---
@@ -38,8 +36,8 @@ def run_command(command, cwd=None, python_executable=None):
 
 def validate_changes(python_executable):
     """
-    Runs the validation process and now CAPTURES performance metrics from stdout.
-    Returns a tuple: (bool: success, str: formatted_metrics or None)
+    Runs the validation process and captures performance metrics if they exist.
+    Success is determined by exit code, not by presence of metrics.
     """
     print("\n--- Running Validation Step 1: Creating output folders ---")
     _, stderr_sh, returncode_sh = run_command(["bash", "./make_output_folders.sh"])
@@ -75,10 +73,9 @@ def validate_changes(python_executable):
         )
         print("Successfully parsed metrics from validation output.")
         return True, metrics_body
-    except (AttributeError, IndexError) as e:
-        print("Warning: Validation script ran successfully, but failed to parse metrics from output.", file=sys.stderr)
-        print(f"Parser error: {e}", file=sys.stderr)
-        return True, "Metrics parsing failed."
+    except (AttributeError, IndexError):
+        print("Warning: Validation script ran successfully, but metrics were not found in the output.", file=sys.stderr)
+        return True, "Metrics not available for this run."
 
 # --- The Agent's Logic ---
 class DependencyAgent:
@@ -86,51 +83,58 @@ class DependencyAgent:
         self.pypi = PyPISimple()
         self.requirements_path = Path(REQUIREMENTS_FILE)
         self.primary_packages = self._load_primary_packages()
+        self.llm_available = True
 
     def _load_primary_packages(self):
         primary_path = Path(PRIMARY_REQUIREMENTS_FILE)
         if not primary_path.exists():
-            print(f"Info: {PRIMARY_REQUIREMENTS_FILE} not found. All packages will be treated as transient.")
             return set()
         with open(primary_path, "r") as f:
-            return {line.strip() for line in f if line.strip() and not line.startswith('#')}
+            return {self._get_package_name_from_spec(line.strip()) for line in f if line.strip() and not line.startswith('#')}
+
+    def _get_package_name_from_spec(self, spec_line):
+        match = re.match(r'([a-zA-Z0-9\-_]+)', spec_line)
+        return match.group(1) if match else None
 
     def _get_requirements_state(self):
         if not self.requirements_path.exists():
-            print(f"Error: {REQUIREMENTS_FILE} not found.", file=sys.stderr); sys.exit(1)
+            sys.exit(f"Error: {REQUIREMENTS_FILE} not found.")
         with open(self.requirements_path, "r") as f:
             lines = [line.strip() for line in f if line.strip() and not line.startswith('#')]
         is_pinned = all('==' in line for line in lines)
         return is_pinned, lines
 
     def _bootstrap_unpinned_requirements(self):
-        # This function remains unchanged
-        print("Unpinned requirements detected. Attempting to create a stable baseline...")
-        venv_dir = Path("./temp_venv");
+        print("Unpinned requirements detected. Creating a stable baseline...")
+        venv_dir = Path("./temp_venv")
         if venv_dir.exists(): shutil.rmtree(venv_dir)
         venv.create(venv_dir, with_pip=True)
         python_executable = str(venv_dir / "bin" / "python")
         _, stderr, returncode = run_command([python_executable, "-m", "pip", "install", "-r", str(self.requirements_path)])
         if returncode != 0:
-            print("CRITICAL ERROR: Failed to install initial set of dependencies.", file=sys.stderr); sys.exit(1)
+            sys.exit("CRITICAL ERROR: Failed to install initial set of dependencies.")
         success, metrics = validate_changes(python_executable)
         if not success:
-            print("CRITICAL ERROR: The latest compatible dependencies failed validation.", file=sys.stderr); sys.exit(1)
+            sys.exit("CRITICAL ERROR: Initial dependencies failed validation.")
         installed_packages, _, _ = run_command([python_executable, "-m", "pip", "freeze"])
-        with open(self.requirements_path, "w") as f: f.write(installed_packages)
-        with open(METRICS_OUTPUT_FILE, "w") as f: f.write(metrics)
+        with open(self.requirements_path, "w") as f:
+            f.write(installed_packages)
+        if metrics:
+            with open(METRICS_OUTPUT_FILE, "w") as f:
+                f.write(metrics)
 
     def run(self):
-        """Main execution loop for the agent."""
         if os.path.exists(METRICS_OUTPUT_FILE): os.remove(METRICS_OUTPUT_FILE)
         is_pinned, lines = self._get_requirements_state()
         if not is_pinned:
             self._bootstrap_unpinned_requirements()
             return
 
-        original_requirements = {line.split('==')[0]: line.split('==')[1] for line in lines}
+        original_requirements = {self._get_package_name_from_spec(line): line for line in lines}
         packages_to_update = []
-        for package, current_version in original_requirements.items():
+        for package, spec in original_requirements.items():
+            if '==' not in spec: continue
+            current_version = spec.split('==')[1]
             latest_version = self.get_latest_version(package)
             if latest_version and latest_version != current_version:
                 packages_to_update.append((package, latest_version))
@@ -148,54 +152,36 @@ class DependencyAgent:
             else:
                 failed_updates.append(f"{package} (target: {version})")
         
-        # --- FINAL SUMMARY AND HEALTH CHECK BLOCK ---
-        # First, print the summary of what happened during the run.
         if successful_updates or failed_updates:
-            print("\n" + "#"*70)
-            print("### UPDATE RUN SUMMARY ###")
+            print("\n" + "#"*70); print("### UPDATE RUN SUMMARY ###")
             if successful_updates:
                 print("\n[SUCCESS] The following packages were successfully updated:")
-                for pkg in successful_updates:
-                    print(f"- {pkg}")
+                for pkg in successful_updates: print(f"- {pkg}")
             if failed_updates:
                 print("\n[FAILURE] The following packages had updates available but FAILED:")
-                for pkg in failed_updates:
-                    print(f"- {pkg}")
+                for pkg in failed_updates: print(f"- {pkg}")
             print("#"*70 + "\n")
 
-        # Then, if any updates were made, run the final health check.
         if successful_updates:
-            print("\n" + "#"*70)
-            print("### Verifying the new state of requirements.txt ###")
-            print("This step validates the combination of all successful updates from this run.")
-            print("#"*70 + "\n")
-
+            print("\n" + "#"*70); print("### FINAL SYSTEM HEALTH CHECK ON COMBINED UPDATES ###")
+            print("This step validates the combination of all successful updates from this run."); print("#"*70 + "\n")
             venv_dir = Path("./final_venv")
             if venv_dir.exists(): shutil.rmtree(venv_dir)
             venv.create(venv_dir, with_pip=True)
             python_executable = str(venv_dir / "bin" / "python")
-            
-            print("Installing final set of dependencies from requirements.txt...")
             _, stderr, returncode = run_command([python_executable, "-m", "pip", "install", "-r", str(self.requirements_path)])
-
             if returncode != 0:
-                print("CRITICAL ERROR: Final installation of combined dependencies failed!", file=sys.stderr)
-                return
-
-            print("\nRunning final validation...")
+                print("CRITICAL ERROR: Final installation of combined dependencies failed!", file=sys.stderr); return
             success, metrics = validate_changes(python_executable)
-            
             if success and metrics:
-                print("\n" + "="*70)
-                print("=== System Metrics for the new requirements.txt ===")
+                print("\n" + "="*70); print("=== FINAL METRICS FOR THE FULLY UPDATED ENVIRONMENT ===")
                 indented_metrics = "\n".join([f"  {line}" for line in metrics.split('\n')])
-                print(indented_metrics)
-                print("="*70)
+                print(indented_metrics); print("="*70)
+            elif success:
+                print("\n" + "="*70); print("=== Final validation passed, but metrics were not available in output. ==="); print("="*70)
             else:
-                print("\n" + "!"*70)
-                print("!!! CRITICAL ERROR: Final validation of combined dependencies failed! !!!")
-                print("!"*70)
-            
+                print("\n" + "!"*70); print("!!! CRITICAL ERROR: Final validation of combined dependencies failed! !!!"); print("!"*70)
+
     def get_latest_version(self, package_name):
         try:
             package_info = self.pypi.get_project_page(package_name)
@@ -205,7 +191,6 @@ class DependencyAgent:
         except Exception: return None
         
     def attempt_update(self, package_to_update, new_version, is_primary):
-        """Attempts to update a single package and now returns True on success."""
         package_label = "(Primary)" if is_primary else "(Transient)"
         print(f"\n{'='*20} Attempting to update {package_to_update} {package_label} to {new_version} {'='*20}")
         venv_dir = Path("./temp_venv")
@@ -214,46 +199,48 @@ class DependencyAgent:
         python_executable = str(venv_dir / "bin" / "python")
         with open(self.requirements_path, "r") as f:
              lines = [line.strip() for line in f if line.strip() and not line.startswith('#')]
-        updated_reqs = {line.split('==')[0]: line.split('==')[1] for line in lines}
-        updated_reqs[package_to_update] = new_version
-        requirements_list = [f"{p}=={v}" for p, v in updated_reqs.items()]
+        
+        requirements_list = []
+        for line in lines:
+            pkg_name = self._get_package_name_from_spec(line)
+            if pkg_name == package_to_update:
+                requirements_list.append(f"{package_to_update}=={new_version}")
+            else:
+                requirements_list.append(line)
         
         _, stderr, returncode = run_command([python_executable, "-m", "pip", "install"] + requirements_list)
         if returncode != 0:
-            solution = self.resolve_conflict_with_llm(stderr, requirements_list)
-            if solution:
-                _, stderr, returncode = run_command([python_executable, "-m", "pip", "install"] + solution)
-                if returncode != 0:
-                    print("LLM's solution failed. Skipping this update.", file=sys.stderr); return False
+            if self.llm_available:
+                solution = self.resolve_conflict_with_llm(stderr, requirements_list)
+                if solution:
+                    _, stderr, returncode = run_command([python_executable, "-m", "pip", "install"] + solution)
+                    if returncode != 0: return False
+                else: return False
             else:
-                print("LLM could not find a solution. Skipping this update.", file=sys.stderr); return False
+                print("Initial install failed and LLM is unavailable due to quota. Skipping.", file=sys.stderr)
+                return False
         
-        print("Installation successful. Proceeding to validation...")
         success, metrics = validate_changes(python_executable)
-        if not success:
-            print(f"Validation failed for the update of {package_to_update}. Reverting.", file=sys.stderr)
-            return False
+        if not success: return False
 
-        print("\n" + "*"*60)
-        print(f"** SUCCESS: {package_to_update} {package_label} was updated to {new_version} and passed validation. **")
-        indented_metrics = "\n".join([f"  {line}" for line in metrics.split('\n')])
-        print(indented_metrics)
-        print("*"*60 + "\n")
+        if metrics:
+            print(f"\n** SUCCESS: {package_to_update} {package_label} was updated to {new_version} and passed validation. **")
+            indented_metrics = "\n".join([f"  {line}" for line in metrics.split('\n')])
+            print(indented_metrics + "\n")
+            with open(METRICS_OUTPUT_FILE, "w") as f: f.write(metrics)
+        else:
+            print(f"\n** SUCCESS: {package_to_update} {package_label} updated and passed validation, but metrics were not in output. **\n")
 
-        print(f"Freezing new state to {self.requirements_path}...")
         installed_packages, _, _ = run_command([python_executable, "-m", "pip", "freeze"])
         with open(self.requirements_path, "w") as f: f.write(installed_packages)
-        with open(METRICS_OUTPUT_FILE, "w") as f: f.write(metrics)
         return True
 
     def resolve_conflict_with_llm(self, error_message, requirements_list):
-        # This function is unchanged
         py_version = f"{sys.version_info.major}.{sys.version_info.minor}"
-        original_packages = {req.split('==')[0] for req in requirements_list}
+        original_packages = {self._get_package_name_from_spec(req) for req in requirements_list}
         prompt = f"""
         I am an automated script trying to resolve a Python dependency conflict for a project running on Python {py_version}. My attempt to install the following packages failed:
         {requirements_list}
-
         The exact error message from pip was:
         ---
         {error_message}
@@ -261,9 +248,9 @@ class DependencyAgent:
         Your task is to provide a new, corrected list of packages that resolves this conflict.
         Constraints:
         1. The new list MUST be compatible with Python {py_version}.
-        2. The new list MUST include every package from the original list. Do not omit any.
+        2. The new list MUST include every package from the original list.
         3. Your response MUST be ONLY a Python list of strings in the format 'package_name==version'.
-        Example response: ['numpy==1.26.4', 'pandas==2.2.0', 'scipy==1.11.4']
+        Example response: ['numpy<2.0', 'pandas==2.2.0', 'scipy==1.11.4']
         """
         try:
             print(f"Sending prompt to LLM for conflict resolution (context: Python {py_version})...")
@@ -274,9 +261,13 @@ class DependencyAgent:
             list_string = match.group(1)
             solution_list = ast.literal_eval(list_string)
             if not isinstance(solution_list, list): return None
-            solution_packages = {req.split('==')[0] for req in solution_list}
+            solution_packages = {self._get_package_name_from_spec(req) for req in solution_list}
             if original_packages != solution_packages: return None
             return solution_list
+        except ResourceExhausted:
+            print("\n!!! WARNING: LLM daily quota has been exceeded. The agent will continue without conflict resolution. !!!\n")
+            self.llm_available = False
+            return None
         except Exception as e:
             print(f"Error parsing LLM response or communicating with API: {e}", file=sys.stderr)
             return None
