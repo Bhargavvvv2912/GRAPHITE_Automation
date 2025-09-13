@@ -33,7 +33,7 @@ jobs:
         run: pip install google-generativeai pypi-simple
 
       - name: Run the Autonomous Agent
-        run: python dependency_agent.py
+        run: python update_dependency.py
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
       
