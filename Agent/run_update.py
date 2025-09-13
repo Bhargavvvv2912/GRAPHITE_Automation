@@ -10,22 +10,17 @@ OUTDATED_FILE = "outdated.txt"
 LOGS_DIR = "logs"
 METRICS_FILE = os.path.join(LOGS_DIR, "metrics.json")
 
-
 def read_outdated():
-    """Read all outdated packages from outdated.txt"""
     if not os.path.exists(OUTDATED_FILE):
-        return []
+        return None
     with open(OUTDATED_FILE, "r") as f:
         lines = f.readlines()
-    outdated = []
-    for line in lines:
-        if line.strip():
-            pkg, old, new = line.strip().split()
-            outdated.append((pkg, old, new))
-    return outdated
+    if not lines:
+        return None
+    pkg, old, new = lines[0].strip().split()
+    return pkg, old, new
 
 def update_lock(pkg, new_version):
-    """Update requirements.lock with given version"""
     updated_lines = []
     with open(LOCK_FILE, "r") as f:
         for line in f:
@@ -50,16 +45,15 @@ def parse_metrics(output: str):
     if m3: metrics["queries"] = int(m3.group(1))
     return metrics
 
-def save_metrics(pkg, old, new, metrics, llm_summary, success):
+def save_metrics(pkg, old, new, metrics, llm_summary):
     os.makedirs(LOGS_DIR, exist_ok=True)
     entry = {
         "timestamp": datetime.now().isoformat(),
         "package": pkg,
         "old_version": old,
         "new_version": new,
-        "success": success,
         "metrics": metrics,
-        "llm_summary": llm_summary,
+        "llm_summary": llm_summary
     }
     if os.path.exists(METRICS_FILE):
         with open(METRICS_FILE, "r") as f:
@@ -90,70 +84,45 @@ def run_tests():
 
     return True, out2
 
-def git_commit(msg):
-    run_command("git config user.name 'Bhargavvvv2912'")
-    run_command("git config user.email 'bhargavksrinidhi@gmail.com'")
+def git_commit(pkg, old, new):
+    run_command("git config user.name 'autoupdate-bot'")
+    run_command("git config user.email 'autoupdate-bot@example.com'")
     run_command("git add requirements.lock logs/")
-    run_command(f'git commit -m "{msg}"')
-
-def bulk_update(outdated_list):
-    """Try to update all packages in one go"""
-    for pkg, _, new in outdated_list:
-        update_lock(pkg, new)
-    return run_command("pip install -r requirements.lock")
+    run_command(f'git commit -m "Update {pkg}: {old} → {new}"')
 
 def main():
-    outdated_list = read_outdated()
-    if not outdated_list:
-        print("No outdated dependencies left")
+    outdated = read_outdated()
+    if not outdated:
+        print("✅ No outdated dependencies left")
+        return
+    pkg, old, new = outdated
+    print(f"🔄 Updating {pkg}: {old} → {new}")
+
+    # 🧠 Call LLM with repo context (imports + relevant files)
+    llm_summary = summarize_changes(pkg, old, new, repo_path=".")
+    print(f"🧠 LLM Summary for {pkg}:\n{llm_summary}")
+
+    # Update lock file
+    update_lock(pkg, new)
+
+    # Install new version
+    code, _ = run_command(f"pip install {pkg}=={new}")
+    if code != 0:
+        print(f"❌ Failed to install {pkg}=={new}, reverting")
+        update_lock(pkg, old)
         return
 
-    # Pre-compute LLM summaries
-    summaries = {}
-    for pkg, old, new in outdated_list:
-        summaries[pkg] = summarize_changes(pkg, old, new, repo_path=".")
-
-    print(f" Attempting bulk update for {len(outdated_list)} packages...")
-    code, _ = bulk_update(outdated_list)
-    if code == 0:
-        success, output = run_tests()
-        if success:
-            metrics = parse_metrics(output)
-            print(" Bulk update succeeded!")
-            for pkg, old, new in outdated_list:
-                save_metrics(pkg, old, new, metrics, summaries[pkg], True)
-            git_commit("Bulk update: multiple packages")
-            return
-        else:
-            print(" Bulk update failed → falling back to per-package updates.")
-
-    print(" Proceeding with individual package updates...")
-    for pkg, old, new in outdated_list:
-        print(f" Updating {pkg}: {old} → {new}")
-
-        # Update lock file
-        update_lock(pkg, new)
-
-        # Install new version
-        code, _ = run_command(f"pip install {pkg}=={new}")
-        if code != 0:
-            print(f" Failed to install {pkg}=={new}, reverting")
-            update_lock(pkg, old)
-            save_metrics(pkg, old, new, {}, summaries[pkg], False)
-            continue
-
-        # Run smoke tests
-        success, output = run_tests()
-        metrics = parse_metrics(output) if success else {}
-        save_metrics(pkg, old, new, metrics, summaries[pkg], success)
-
-        if success:
-            print(f" Tests passed with {pkg}=={new}, metrics={metrics}")
-            git_commit(f"Update {pkg}: {old} → {new}")
-        else:
-            print(f" Tests failed with {pkg}=={new}, reverting")
-            update_lock(pkg, old)
-            run_command(f"pip install {pkg}=={old}")
+    # Run smoke tests
+    success, output = run_tests()
+    if success:
+        metrics = parse_metrics(output)
+        print(f"✅ Tests passed with {pkg}=={new}, metrics={metrics}")
+        save_metrics(pkg, old, new, metrics, llm_summary)
+        git_commit(pkg, old, new)
+    else:
+        print(f"❌ Tests failed with {pkg}=={new}, reverting")
+        update_lock(pkg, old)
+        run_command(f"pip install {pkg}=={old}")
 
 if __name__ == "__main__":
     main()
