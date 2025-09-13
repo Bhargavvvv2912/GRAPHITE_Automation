@@ -88,7 +88,6 @@ class DependencyAgent:
         self.primary_packages = self._load_primary_packages()
 
     def _load_primary_packages(self):
-        """Loads the set of primary package names from the dedicated file."""
         primary_path = Path(PRIMARY_REQUIREMENTS_FILE)
         if not primary_path.exists():
             print(f"Info: {PRIMARY_REQUIREMENTS_FILE} not found. All packages will be treated as transient.")
@@ -140,16 +139,35 @@ class DependencyAgent:
             print("\nAll dependencies are up-to-date.")
             return
 
-        updates_performed = False
+        successful_updates = []
+        failed_updates = []
         for package, version in packages_to_update:
             is_primary = package in self.primary_packages
             if self.attempt_update(package, version, is_primary):
-                updates_performed = True
-
-        # <<< --- NEW: FINAL HEALTH CHECK BLOCK --- >>>
-        if updates_performed:
+                successful_updates.append(f"{package}=={version}")
+            else:
+                failed_updates.append(f"{package} (target: {version})")
+        
+        # --- FINAL SUMMARY AND HEALTH CHECK BLOCK ---
+        # First, print the summary of what happened during the run.
+        if successful_updates or failed_updates:
             print("\n" + "#"*70)
-            print("### FINAL SYSTEM HEALTH CHECK ON COMBINED UPDATES ###")
+            print("### UPDATE RUN SUMMARY ###")
+            if successful_updates:
+                print("\n[SUCCESS] The following packages were successfully updated:")
+                for pkg in successful_updates:
+                    print(f"- {pkg}")
+            if failed_updates:
+                print("\n[FAILURE] The following packages had updates available but FAILED:")
+                for pkg in failed_updates:
+                    print(f"- {pkg}")
+            print("#"*70 + "\n")
+
+        # Then, if any updates were made, run the final health check.
+        if successful_updates:
+            print("\n" + "#"*70)
+            print("### Verifying the new state of requirements.txt ###")
+            print("This step validates the combination of all successful updates from this run.")
             print("#"*70 + "\n")
 
             venv_dir = Path("./final_venv")
@@ -162,7 +180,6 @@ class DependencyAgent:
 
             if returncode != 0:
                 print("CRITICAL ERROR: Final installation of combined dependencies failed!", file=sys.stderr)
-                print("Error:", stderr, file=sys.stderr)
                 return
 
             print("\nRunning final validation...")
@@ -170,7 +187,7 @@ class DependencyAgent:
             
             if success and metrics:
                 print("\n" + "="*70)
-                print("=== FINAL METRICS FOR THE FULLY UPDATED ENVIRONMENT ===")
+                print("=== System Metrics for the new requirements.txt ===")
                 indented_metrics = "\n".join([f"  {line}" for line in metrics.split('\n')])
                 print(indented_metrics)
                 print("="*70)
@@ -178,7 +195,6 @@ class DependencyAgent:
                 print("\n" + "!"*70)
                 print("!!! CRITICAL ERROR: Final validation of combined dependencies failed! !!!")
                 print("!"*70)
-        # <<< --- END OF FINAL HEALTH CHECK BLOCK --- >>>
             
     def get_latest_version(self, package_name):
         try:
@@ -231,6 +247,7 @@ class DependencyAgent:
         return True
 
     def resolve_conflict_with_llm(self, error_message, requirements_list):
+        # This function is unchanged
         py_version = f"{sys.version_info.major}.{sys.version_info.minor}"
         original_packages = {req.split('==')[0] for req in requirements_list}
         prompt = f"""
@@ -252,27 +269,13 @@ class DependencyAgent:
             print(f"Sending prompt to LLM for conflict resolution (context: Python {py_version})...")
             response = llm.generate_content(prompt)
             response_text = response.text.strip()
-            
-            # Use regex to find the list within the text, making it robust to extra text from the LLM.
             match = re.search(r'(\[.*?\])', response_text, re.DOTALL)
-            if not match:
-                print(f"LLM Error: Could not find a list in the response text.", file=sys.stderr)
-                return None
-
+            if not match: return None
             list_string = match.group(1)
             solution_list = ast.literal_eval(list_string)
-
-            if not isinstance(solution_list, list):
-                print(f"LLM Error: Parsed structure was not a list.", file=sys.stderr)
-                return None
-            
-            # Verify the solution contains the same packages
+            if not isinstance(solution_list, list): return None
             solution_packages = {req.split('==')[0] for req in solution_list}
-            if original_packages != solution_packages:
-                print(f"LLM Error: Solution did not contain the correct set of packages.", file=sys.stderr)
-                return None
-            
-            print("LLM provided a valid and verified solution.")
+            if original_packages != solution_packages: return None
             return solution_list
         except Exception as e:
             print(f"Error parsing LLM response or communicating with API: {e}", file=sys.stderr)
