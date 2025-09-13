@@ -1,0 +1,16 @@
+# primary_requirements.txt
+matplotlib
+numpy
+prettytable
+opencv-python
+pandas
+torchvision
+joblib
+tqdm
+scipy
+torch
+kornia
+Pillow
+python-Levenshtein
+google-generativeai
+pypi-simple

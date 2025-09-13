@@ -14,6 +14,7 @@ from pypi_simple import PyPISimple
 
 # --- Configuration ---
 REQUIREMENTS_FILE = "requirements.txt"
+PRIMARY_REQUIREMENTS_FILE = "primary_requirements.txt" 
 METRICS_OUTPUT_FILE = "metrics_output.txt"
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
@@ -84,9 +85,18 @@ class DependencyAgent:
     def __init__(self):
         self.pypi = PyPISimple()
         self.requirements_path = Path(REQUIREMENTS_FILE)
+        self.primary_packages = self._load_primary_packages()
+
+    def _load_primary_packages(self):
+        """Loads the set of primary package names from the dedicated file."""
+        primary_path = Path(PRIMARY_REQUIREMENTS_FILE)
+        if not primary_path.exists():
+            print(f"Info: {PRIMARY_REQUIREMENTS_FILE} not found. All packages will be treated as transient.")
+            return set()
+        with open(primary_path, "r") as f:
+            return {line.strip() for line in f if line.strip() and not line.startswith('#')}
 
     def _get_requirements_state(self):
-        """Checks if requirements are pinned and returns the lines."""
         if not self.requirements_path.exists():
             print(f"Error: {REQUIREMENTS_FILE} not found.", file=sys.stderr); sys.exit(1)
         with open(self.requirements_path, "r") as f:
@@ -95,27 +105,21 @@ class DependencyAgent:
         return is_pinned, lines
 
     def _bootstrap_unpinned_requirements(self):
-        """Creates a stable, pinned baseline from an unpinned requirements file."""
+        # This function remains unchanged
         print("Unpinned requirements detected. Attempting to create a stable baseline...")
         venv_dir = Path("./temp_venv");
         if venv_dir.exists(): shutil.rmtree(venv_dir)
         venv.create(venv_dir, with_pip=True)
         python_executable = str(venv_dir / "bin" / "python")
-        print("Installing from unpinned requirements file to get latest compatible versions...")
         _, stderr, returncode = run_command([python_executable, "-m", "pip", "install", "-r", str(self.requirements_path)])
         if returncode != 0:
             print("CRITICAL ERROR: Failed to install initial set of dependencies.", file=sys.stderr); sys.exit(1)
-        
-        print("Initial installation successful. Validating the baseline...")
         success, metrics = validate_changes(python_executable)
         if not success:
             print("CRITICAL ERROR: The latest compatible dependencies failed validation.", file=sys.stderr); sys.exit(1)
-
-        print("Validation successful! Freezing the working dependencies to requirements.txt.")
         installed_packages, _, _ = run_command([python_executable, "-m", "pip", "freeze"])
         with open(self.requirements_path, "w") as f: f.write(installed_packages)
         with open(METRICS_OUTPUT_FILE, "w") as f: f.write(metrics)
-        print("Bootstrap complete. A stable, pinned requirements.txt has been created.")
 
     def run(self):
         """Main execution loop for the agent."""
@@ -136,11 +140,47 @@ class DependencyAgent:
             print("\nAll dependencies are up-to-date.")
             return
 
+        updates_performed = False
         for package, version in packages_to_update:
-            self.attempt_update(package, version)
+            is_primary = package in self.primary_packages
+            if self.attempt_update(package, version, is_primary):
+                updates_performed = True
+
+        # <<< --- NEW: FINAL HEALTH CHECK BLOCK --- >>>
+        if updates_performed:
+            print("\n" + "#"*70)
+            print("### FINAL SYSTEM HEALTH CHECK ON COMBINED UPDATES ###")
+            print("#"*70 + "\n")
+
+            venv_dir = Path("./final_venv")
+            if venv_dir.exists(): shutil.rmtree(venv_dir)
+            venv.create(venv_dir, with_pip=True)
+            python_executable = str(venv_dir / "bin" / "python")
+            
+            print("Installing final set of dependencies from requirements.txt...")
+            _, stderr, returncode = run_command([python_executable, "-m", "pip", "install", "-r", str(self.requirements_path)])
+
+            if returncode != 0:
+                print("CRITICAL ERROR: Final installation of combined dependencies failed!", file=sys.stderr)
+                print("Error:", stderr, file=sys.stderr)
+                return
+
+            print("\nRunning final validation...")
+            success, metrics = validate_changes(python_executable)
+            
+            if success and metrics:
+                print("\n" + "="*70)
+                print("=== FINAL METRICS FOR THE FULLY UPDATED ENVIRONMENT ===")
+                indented_metrics = "\n".join([f"  {line}" for line in metrics.split('\n')])
+                print(indented_metrics)
+                print("="*70)
+            else:
+                print("\n" + "!"*70)
+                print("!!! CRITICAL ERROR: Final validation of combined dependencies failed! !!!")
+                print("!"*70)
+        # <<< --- END OF FINAL HEALTH CHECK BLOCK --- >>>
             
     def get_latest_version(self, package_name):
-        """Gets the latest version of a package from PyPI."""
         try:
             package_info = self.pypi.get_project_page(package_name)
             if package_info and package_info.packages:
@@ -148,9 +188,10 @@ class DependencyAgent:
                 return versions[0] if versions else None
         except Exception: return None
         
-    def attempt_update(self, package_to_update, new_version):
-        """Attempts to update a single package, resolve conflicts, and validate."""
-        print(f"\n{'='*20} Attempting to update {package_to_update} to {new_version} {'='*20}")
+    def attempt_update(self, package_to_update, new_version, is_primary):
+        """Attempts to update a single package and now returns True on success."""
+        package_label = "(Primary)" if is_primary else "(Transient)"
+        print(f"\n{'='*20} Attempting to update {package_to_update} {package_label} to {new_version} {'='*20}")
         venv_dir = Path("./temp_venv")
         if venv_dir.exists(): shutil.rmtree(venv_dir)
         venv.create(venv_dir, with_pip=True)
@@ -167,18 +208,18 @@ class DependencyAgent:
             if solution:
                 _, stderr, returncode = run_command([python_executable, "-m", "pip", "install"] + solution)
                 if returncode != 0:
-                    print("LLM's solution failed. Skipping this update.", file=sys.stderr); return
+                    print("LLM's solution failed. Skipping this update.", file=sys.stderr); return False
             else:
-                print("LLM could not find a solution. Skipping this update.", file=sys.stderr); return
+                print("LLM could not find a solution. Skipping this update.", file=sys.stderr); return False
         
         print("Installation successful. Proceeding to validation...")
         success, metrics = validate_changes(python_executable)
         if not success:
             print(f"Validation failed for the update of {package_to_update}. Reverting.", file=sys.stderr)
-            return
+            return False
 
         print("\n" + "*"*60)
-        print(f"** SUCCESS: {package_to_update} was updated to {new_version} and passed validation. **")
+        print(f"** SUCCESS: {package_to_update} {package_label} was updated to {new_version} and passed validation. **")
         indented_metrics = "\n".join([f"  {line}" for line in metrics.split('\n')])
         print(indented_metrics)
         print("*"*60 + "\n")
@@ -187,6 +228,7 @@ class DependencyAgent:
         installed_packages, _, _ = run_command([python_executable, "-m", "pip", "freeze"])
         with open(self.requirements_path, "w") as f: f.write(installed_packages)
         with open(METRICS_OUTPUT_FILE, "w") as f: f.write(metrics)
+        return True
 
     def resolve_conflict_with_llm(self, error_message, requirements_list):
         py_version = f"{sys.version_info.major}.{sys.version_info.minor}"
