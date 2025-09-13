@@ -1,36 +1,82 @@
-name: Auto Update Dependencies
+name: Autonomous Dependency Updater
 
 on:
+  # Runs on a schedule (every 3 days)
   schedule:
-    - cron: '0 0 */3 * *'  # every 3 days
-  workflow_dispatch:  # allows manual triggering
+    - cron: '0 0 */3 * *'
+  # Allows you to run this workflow manually from the Actions tab
+  workflow_dispatch:
 
 jobs:
-  update:
+  # JOB 1: UPDATE THE DEPENDENCIES ON THE BASELINE PYTHON VERSION
+  update-dependencies:
     runs-on: ubuntu-latest
-    env:
-      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+    strategy:
+      # This job runs on the primary/oldest Python version you want to support.
+      # This provides a stable environment for dependency resolution.
+      matrix:
+        python-version: ['3.9'] 
+    
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v4
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
         with:
-          python-version: "3.10"
+          python-version: ${{ matrix.python-version }}
 
-      - name: Install dependencies
+      - name: Install agent dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install google-generativeai pypi-simple
+
+      - name: Run the Autonomous Agent to update requirements.txt
+        run: python dependency_agent.py
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+
+      - name: Commit and push changes if any
+        run: |
+          git config --global user.name 'Dependency Agent'
+          git config --global user.email 'agent@users.noreply.github.com'
+          # Only commit and push if the requirements.txt file was actually changed
+          if ! git diff --quiet requirements.txt; then
+            echo "Dependencies updated. Committing changes."
+            git add requirements.txt
+            git commit -m "chore(deps): update dependencies via autonomous agent"
+            git push
+          else
+            echo "No dependency changes to commit."
+          fi
+
+  # JOB 2: VALIDATE THE NEW DEPENDENCIES ON NEWER PYTHON VERSIONS
+  validate-on-other-versions:
+    # This job only runs if the main 'update-dependencies' job was successful
+    needs: update-dependencies
+    runs-on: ubuntu-latest
+    strategy:
+      # This matrix tests forward-compatibility against newer Python versions
+      matrix:
+        python-version: ['3.10', '3.11', '3.12']
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install the newly updated dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run auto-update agent
-        run: python3 agent/run_update.py
-
-      - name: Commit & push changes if any
+      - name: Run validation script on Python ${{ matrix.python-version }}
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add requirements.lock logs/
-          git diff --cached --quiet || git commit -m "Automated dependency update"
-          git push
+          echo "--- Running Validation Step 1: Creating output folders ---"
+          bash ./make_output_folders.sh
+          echo "--- Running Validation Step 2: Executing main attack script ---"
+          python3 main.py -v 14 -t 1 --tr_lo 0.65 --tr_hi 0.85 -s score.py -n GTSRB --heatmap=Target --coarse_mode=binary -b 100 -m 100
