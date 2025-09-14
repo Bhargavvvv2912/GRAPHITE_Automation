@@ -24,26 +24,41 @@ genai.configure(api_key=GEMINI_API_KEY)
 llm = genai.GenerativeModel('gemini-1.5-flash')
 
 # --- Helper Functions ---
+def start_group(title):
+    """Starts a collapsible log group in GitHub Actions."""
+    print(f"\n::group::{title}")
+
+def end_group():
+    """Ends a collapsible log group in GitHub Actions."""
+    print("::endgroup::")
+
 def run_command(command, cwd=None, python_executable=None):
     """Runs a command and returns the output, error, and return code."""
     full_command = command
     if python_executable and command[0].startswith('python'):
         full_command = [python_executable] + command[1:]
     
-    print(f"Running command: {' '.join(full_command)}")
+    # Do not print the full command if it's too long
+    display_command = ' '.join(full_command)
+    if len(display_command) > 200:
+        display_command = display_command[:200] + "..."
+    print(f"Running command: {display_command}")
+    
     result = subprocess.run(full_command, capture_output=True, text=True, cwd=cwd)
     return result.stdout, result.stderr, result.returncode
 
-def validate_changes(python_executable):
+def validate_changes(python_executable, group_title="Running Validation Script (main.py)"):
     """
-    Runs the validation process and captures performance metrics if they exist.
-    Success is determined by exit code, not by presence of metrics.
+    Runs the validation process inside a collapsible group and captures metrics.
     """
+    start_group(group_title)
+    
     print("\n--- Running Validation Step 1: Creating output folders ---")
     _, stderr_sh, returncode_sh = run_command(["bash", "./make_output_folders.sh"])
     if returncode_sh != 0:
         print("Validation Failed: The 'make_output_folders.sh' script failed.", file=sys.stderr)
         print("Error:", stderr_sh, file=sys.stderr)
+        end_group()
         return False, None
     print("Validation Step 1 successful.")
 
@@ -56,11 +71,20 @@ def validate_changes(python_executable):
     ]
     
     stdout_py, stderr_py, returncode_py = run_command(validation_command, python_executable=python_executable)
+
+    print("\n--- Captured output from main.py ---")
+    print(f"STDOUT:\n---\n{stdout_py}\n---")
+    if stderr_py:
+        print(f"STDERR:\n---\n{stderr_py}\n---")
+    print("--- End of captured output ---\n")
+
     if returncode_py != 0:
         print("Validation Failed: The main.py script returned a non-zero exit code.", file=sys.stderr)
-        print("Error:", stderr_py, file=sys.stderr)
+        end_group()
         return False, None
     
+    end_group()
+
     try:
         tr_score = re.search(r"Final transform_robustness:\s*([\d\.]+)", stdout_py).group(1)
         nbits = re.search(r"Final number of pixels:\s*(\d+)", stdout_py).group(1)
@@ -105,7 +129,7 @@ class DependencyAgent:
         return is_pinned, lines
 
     def _bootstrap_unpinned_requirements(self):
-        print("Unpinned requirements detected. Creating a stable baseline...")
+        print("Unpinned requirements detected. Attempting to create a stable baseline...")
         venv_dir = Path("./temp_venv")
         if venv_dir.exists(): shutil.rmtree(venv_dir)
         venv.create(venv_dir, with_pip=True)
@@ -113,9 +137,18 @@ class DependencyAgent:
         _, stderr, returncode = run_command([python_executable, "-m", "pip", "install", "-r", str(self.requirements_path)])
         if returncode != 0:
             sys.exit("CRITICAL ERROR: Failed to install initial set of dependencies.")
-        success, metrics = validate_changes(python_executable)
+        
+        success, metrics = validate_changes(python_executable, group_title="Running Validation on New Baseline")
         if not success:
             sys.exit("CRITICAL ERROR: Initial dependencies failed validation.")
+
+        if metrics and "not available" not in metrics:
+            print("\n" + "="*70)
+            print("=== BOOTSTRAP SUCCESSFUL: METRICS FOR THE NEW BASELINE ENVIRONMENT ===")
+            indented_metrics = "\n".join([f"  {line}" for line in metrics.split('\n')])
+            print(indented_metrics)
+            print("="*70 + "\n")
+
         installed_packages, _, _ = run_command([python_executable, "-m", "pip", "freeze"])
         with open(self.requirements_path, "w") as f:
             f.write(installed_packages)
@@ -172,8 +205,8 @@ class DependencyAgent:
             _, stderr, returncode = run_command([python_executable, "-m", "pip", "install", "-r", str(self.requirements_path)])
             if returncode != 0:
                 print("CRITICAL ERROR: Final installation of combined dependencies failed!", file=sys.stderr); return
-            success, metrics = validate_changes(python_executable)
-            if success and metrics:
+            success, metrics = validate_changes(python_executable, group_title="Final System Health Check")
+            if success and metrics and "not available" not in metrics:
                 print("\n" + "="*70); print("=== FINAL METRICS FOR THE FULLY UPDATED ENVIRONMENT ===")
                 indented_metrics = "\n".join([f"  {line}" for line in metrics.split('\n')])
                 print(indented_metrics); print("="*70)
@@ -214,16 +247,20 @@ class DependencyAgent:
                 solution = self.resolve_conflict_with_llm(stderr, requirements_list)
                 if solution:
                     _, stderr, returncode = run_command([python_executable, "-m", "pip", "install"] + solution)
-                    if returncode != 0: return False
-                else: return False
+                    if returncode != 0:
+                        print("LLM's solution failed. Skipping this update.", file=sys.stderr); return False
+                else:
+                    return False
             else:
                 print("Initial install failed and LLM is unavailable due to quota. Skipping.", file=sys.stderr)
                 return False
         
         success, metrics = validate_changes(python_executable)
-        if not success: return False
+        if not success:
+            print(f"Validation failed for the update of {package_to_update}. Reverting.", file=sys.stderr)
+            return False
 
-        if metrics:
+        if metrics and "not available" not in metrics:
             print(f"\n** SUCCESS: {package_to_update} {package_label} was updated to {new_version} and passed validation. **")
             indented_metrics = "\n".join([f"  {line}" for line in metrics.split('\n')])
             print(indented_metrics + "\n")
@@ -249,7 +286,7 @@ class DependencyAgent:
         Constraints:
         1. The new list MUST be compatible with Python {py_version}.
         2. The new list MUST include every package from the original list.
-        3. Your response MUST be ONLY a Python list of strings in the format 'package_name==version'.
+        3. Your response MUST be ONLY a Python list of strings in the format 'package_name==version' or 'package_name<version'.
         Example response: ['numpy<2.0', 'pandas==2.2.0', 'scipy==1.11.4']
         """
         try:
@@ -257,7 +294,9 @@ class DependencyAgent:
             response = llm.generate_content(prompt)
             response_text = response.text.strip()
             match = re.search(r'(\[.*?\])', response_text, re.DOTALL)
-            if not match: return None
+            if not match:
+                print(f"LLM Error: Could not find a list in the response text.", file=sys.stderr)
+                return None
             list_string = match.group(1)
             solution_list = ast.literal_eval(list_string)
             if not isinstance(solution_list, list): return None
