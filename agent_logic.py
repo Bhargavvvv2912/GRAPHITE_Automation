@@ -1,5 +1,6 @@
+# agent_logic.py
+
 import os
-import subprocess
 import sys
 import venv
 from pathlib import Path
@@ -7,153 +8,88 @@ import ast
 import shutil
 import re
 import json
-from datetime import datetime, timezone
-import google.generativeai as genai
 from google.api_core.exceptions import ResourceExhausted
 from pypi_simple import PyPISimple
 from packaging.version import parse as parse_version
+from agent_utils import start_group, end_group, run_command, validate_changes
 
-# --- Configuration ---
-REQUIREMENTS_FILE = "requirements.txt"
-PRIMARY_REQUIREMENTS_FILE = "primary_requirements.txt" 
-METRICS_OUTPUT_FILE = "metrics_output.txt"
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-MAX_LLM_BACKTRACK_ATTEMPTS = 3
-MAX_RUN_PASSES = 3
-
-if not GEMINI_API_KEY:
-    sys.exit("Error: GEMINI_API_KEY environment variable not set.")
-
-genai.configure(api_key=GEMINI_API_KEY)
-llm = genai.GenerativeModel('gemini-1.5-flash')
-
-# --- Helper Functions ---
-def start_group(title):
-    """Starts a collapsible log group in GitHub Actions."""
-    print(f"\n::group::{title}")
-
-def end_group():
-    """Ends a collapsible log group in GitHub Actions."""
-    print("::endgroup::")
-
-def run_command(command, cwd=None, python_executable=None):
-    """Runs a command and returns the output, error, and return code."""
-    full_command = command
-    if python_executable and command[0].startswith('python'):
-        full_command = [python_executable] + command[1:]
-    
-    display_command = ' '.join(full_command)
-    if len(display_command) > 200:
-        display_command = display_command[:200] + "..."
-    print(f"Running command: {display_command}")
-    
-    result = subprocess.run(full_command, capture_output=True, text=True, cwd=cwd)
-    return result.stdout, result.stderr, result.returncode
-
-def validate_changes(python_executable, group_title="Running Validation Script"):
-    """
-    Runs the validation process inside a collapsible group and captures metrics.
-    """
-    start_group(group_title)
-    
-    print("\n--- Running Validation Step 1: Creating output folders ---")
-    _, stderr_sh, returncode_sh = run_command(["bash", "./make_output_folders.sh"])
-    if returncode_sh != 0:
-        print(f"Validation Failed: make_output_folders.sh failed.", file=sys.stderr)
-        end_group()
-        return False, None, stderr_sh
-    
-    print("Validation Step 1 successful.")
-
-    print("\n--- Running Validation Step 2: Executing main attack script ---")
-    validation_command = [
-        "python3", "main.py", "-v", "14", "-t", "1",
-        "--tr_lo", "0.65", "--tr_hi", "0.85", "-s", "score.py",
-        "-n", "GTSRB", "--heatmap=Target", "--coarse_mode=binary",
-        "-b", "100", "-m", "100"
-    ]
-    
-    stdout_py, stderr_py, returncode_py = run_command(validation_command, python_executable=python_executable)
-
-    print("\n--- Captured output from main.py ---")
-    print(f"STDOUT:\n---\n{stdout_py}\n---")
-    if stderr_py:
-        print(f"STDERR:\n---\n{stderr_py}\n---")
-    print("--- End of captured output ---\n")
-
-    if returncode_py != 0:
-        print("Validation Failed: main.py returned a non-zero exit code.", file=sys.stderr)
-        end_group()
-        return False, None, stderr_py
-    
-    end_group()
-
-    try:
-        tr_score = re.search(r"Final transform_robustness:\s*([\d\.]+)", stdout_py).group(1)
-        nbits = re.search(r"Final number of pixels:\s*(\d+)", stdout_py).group(1)
-        queries = re.search(r"Final number of queries:\s*(\d+)", stdout_py).group(1)
-        metrics_body = (
-            "Performance Metrics:\n"
-            f"- Transform Robustness: {tr_score}\n"
-            f"- Pixel Count: {nbits}\n"
-            f"- Query Count: {queries}"
-        )
-        return True, metrics_body, stdout_py + stderr_py
-    except (AttributeError, IndexError):
-        return True, "Metrics not available for this run.", stdout_py + stderr_py
-
-# --- The Agent's Logic ---
 class DependencyAgent:
-    def __init__(self):
+    def __init__(self, config, llm_client):
+        self.config = config
+        self.llm = llm_client
         self.pypi = PyPISimple()
-        self.requirements_path = Path(REQUIREMENTS_FILE)
+        self.requirements_path = Path(config["REQUIREMENTS_FILE"])
         self.primary_packages = self._load_primary_packages()
         self.llm_available = True
+        self.usage_scores = self._calculate_usage_scores()
+
+    def _calculate_usage_scores(self):
+        """Scans the repo to find how many times each module is imported."""
+        start_group("Analyzing Codebase for Import Usage")
+        scores = {}
+        repo_root = Path('.')
+        print("Scanning all .py files for import statements...")
+        for py_file in repo_root.rglob('*.py'):
+            if any(part in str(py_file) for part in ['temp_venv', 'final_venv', 'agent_logic.py', 'agent_utils.py', 'dependency_agent.py']):
+                continue
+            try:
+                with open(py_file, 'r', encoding='utf-8') as f:
+                    content = f.read()
+                    tree = ast.parse(content)
+                    for node in ast.walk(tree):
+                        if isinstance(node, ast.Import):
+                            for alias in node.names:
+                                module_name = alias.name.split('.')[0]
+                                scores[module_name] = scores.get(module_name, 0) + 1
+                        elif isinstance(node, ast.ImportFrom):
+                            if node.module:
+                                module_name = node.module.split('.')[0]
+                                scores[module_name] = scores.get(module_name, 0) + 1
+            except Exception as e:
+                print(f"Warning: Could not parse {py_file}. Error: {e}", file=sys.stderr)
+        
+        normalized_scores = {name.replace('_', '-'): score for name, score in scores.items()}
+        print("Usage scores calculated.")
+        end_group()
+        return normalized_scores
 
     def _get_package_name_from_spec(self, spec_line):
         match = re.match(r'([a-zA-Z0-9\-_]+)', spec_line)
         return match.group(1) if match else None
 
     def _load_primary_packages(self):
-        primary_path = Path(PRIMARY_REQUIREMENTS_FILE)
-        if not primary_path.exists():
-            return set()
+        primary_path = Path(self.config["PRIMARY_REQUIREMENTS_FILE"])
+        if not primary_path.exists(): return set()
         with open(primary_path, "r") as f:
             return {self._get_package_name_from_spec(line.strip()) for line in f if line.strip() and not line.startswith('#')}
 
     def _get_requirements_state(self):
-        if not self.requirements_path.exists():
-            sys.exit(f"Error: {REQUIREMENTS_FILE} not found.")
+        if not self.requirements_path.exists(): sys.exit(f"Error: {self.config['REQUIREMENTS_FILE']} not found.")
         with open(self.requirements_path, "r") as f:
             lines = [line.strip() for line in f if line.strip() and not line.startswith('#')]
         return all('==' in line for line in lines), lines
 
     def _bootstrap_unpinned_requirements(self):
         print("Unpinned requirements detected. Creating a stable baseline...")
-        venv_dir = Path("./temp_venv")
+        venv_dir = Path("./temp_venv");
         if venv_dir.exists(): shutil.rmtree(venv_dir)
         venv.create(venv_dir, with_pip=True)
         python_executable = str(venv_dir / "bin" / "python")
         _, stderr, returncode = run_command([python_executable, "-m", "pip", "install", "-r", str(self.requirements_path)])
         if returncode != 0:
             sys.exit("CRITICAL ERROR: Failed to install initial set of dependencies.")
-        
         success, metrics, _ = validate_changes(python_executable, group_title="Running Validation on New Baseline")
         if not success:
             sys.exit("CRITICAL ERROR: Initial dependencies failed validation.")
-
         if metrics and "not available" not in metrics:
             print(f"\n{'='*70}\n=== BOOTSTRAP SUCCESSFUL: METRICS FOR THE NEW BASELINE ===\n" + "\n".join([f"  {line}" for line in metrics.split('\n')]) + f"\n{'='*70}\n")
-
         installed_packages, _, _ = run_command([python_executable, "-m", "pip", "freeze"])
-        with open(self.requirements_path, "w") as f:
-            f.write(installed_packages)
+        with open(self.requirements_path, "w") as f: f.write(installed_packages)
         if metrics:
-            with open(METRICS_OUTPUT_FILE, "w") as f:
-                f.write(metrics)
+            with open(self.config["METRICS_OUTPUT_FILE"], "w") as f: f.write(metrics)
 
     def run(self):
-        if os.path.exists(METRICS_OUTPUT_FILE): os.remove(METRICS_OUTPUT_FILE)
+        if os.path.exists(self.config["METRICS_OUTPUT_FILE"]): os.remove(self.config["METRICS_OUTPUT_FILE"])
         is_pinned, _ = self._get_requirements_state()
         if not is_pinned:
             self._bootstrap_unpinned_requirements()
@@ -163,8 +99,8 @@ class DependencyAgent:
         final_successful_updates = {}
         final_failed_updates = {}
         
-        for pass_num in range(1, MAX_RUN_PASSES + 1):
-            start_group(f"UPDATE PASS {pass_num}/{MAX_RUN_PASSES}")
+        for pass_num in range(1, self.config["MAX_RUN_PASSES"] + 1):
+            start_group(f"UPDATE PASS {pass_num}/{self.config['MAX_RUN_PASSES']} (Constraints: {dynamic_constraints})")
             
             _, lines = self._get_requirements_state()
             all_reqs = list(set(lines + dynamic_constraints))
@@ -183,6 +119,12 @@ class DependencyAgent:
                 else: print("\nNo further updates possible. System has converged.")
                 end_group()
                 break
+            
+            packages_to_update.sort(key=lambda p: self.usage_scores.get(p[0], 0), reverse=True)
+            print("\nPrioritized Update Plan for this Pass:")
+            for pkg, _, target_ver in packages_to_update:
+                score = self.usage_scores.get(pkg, 0)
+                print(f"- {pkg} (Usage Score: {score}) -> {target_ver}")
 
             updates_made_this_pass = False
             learned_a_new_constraint = False
@@ -222,7 +164,7 @@ class DependencyAgent:
             print("#"*70 + "\n")
 
         if final_successful_updates:
-            print("\n" + "#"*70); print("### FINAL SYSTEM HEALTH CHECK ON COMBINED UPDATES ###"); print("#"*70 + "\n")
+            print("\n" + "#"*70); print("### FINAL SYSTEM HEALTH CHECK ###"); print("#"*70 + "\n")
             venv_dir = Path("./final_venv")
             if venv_dir.exists(): shutil.rmtree(venv_dir)
             venv.create(venv_dir, with_pip=True)
@@ -274,7 +216,6 @@ class DependencyAgent:
 
     def attempt_update_with_healing(self, package, current_version, target_version, is_primary, dynamic_constraints):
         package_label = "(Primary)" if is_primary else "(Transient)"
-        print(f"\n{'='*20} Attempting to update {package} {package_label} to {target_version} {'='*20}")
         
         success, result_data, stderr = self._try_install_and_validate(package, target_version, dynamic_constraints)
         
@@ -283,9 +224,7 @@ class DependencyAgent:
             if metrics and "not available" not in metrics:
                 print(f"\n** SUCCESS: {package} {package_label} updated to {target_version} and passed validation. **")
                 print("\n".join([f"  {line}" for line in metrics.split('\n')]) + "\n")
-                with open(METRICS_OUTPUT_FILE, "w") as f: f.write(metrics)
-            else:
-                print(f"\n** SUCCESS: {package} {package_label} updated to {target_version} and passed (metrics unavailable). **\n")
+                with open(self.config["METRICS_OUTPUT_FILE"], "w") as f: f.write(metrics)
             
             installed_packages, _, _ = run_command([Path("./temp_venv/bin/python"), "-m", "pip", "freeze"])
             with open(self.requirements_path, "w") as f: f.write(installed_packages)
@@ -296,26 +235,24 @@ class DependencyAgent:
         root_cause = self._ask_llm_for_root_cause(package, stderr)
         if root_cause and root_cause.get("package") != package:
             constraint = f"{root_cause.get('package')}{root_cause.get('suggested_constraint')}"
-            return False, f"Failed due to diagnosed incompatibility with {root_cause.get('package')}", constraint
+            return False, f"Diagnosed incompatibility with {root_cause.get('package')}", constraint
 
         version_candidates = self._ask_llm_for_version_candidates(package, target_version, stderr)
         if version_candidates:
             for candidate in version_candidates:
                 print(f"INFO: Attempting LLM-suggested backtrack for {package} to {candidate}")
-                success, result_data, _ = self._try_install_and_validate(package, candidate, dynamic_constraints)
+                success, _, _ = self._try_install_and_validate(package, candidate, dynamic_constraints)
                 if success:
-                    # Logic for handling success within backtracking
-                    return True, f"Success after backtracking to LLM suggestion {candidate}", None
+                    return True, f"Backtracked to LLM suggestion {candidate}", None
 
         print(f"INFO: LLM suggestions failed for {package}. Falling back to Binary Search.")
         found_version = self._binary_search_backtrack(package, current_version, target_version, dynamic_constraints)
         if found_version:
-            return True, f"Success after backtracking to stable version {found_version}", None
+            return True, f"Backtracked to stable version {found_version}", None
 
         return False, "All backtracking attempts failed.", None
 
     def _binary_search_backtrack(self, package, last_good_version, failed_version, dynamic_constraints):
-        """Performs a binary search to find the latest working version."""
         start_group(f"Binary Search Backtrack for {package}")
         
         versions = self.get_all_versions_between(package, last_good_version, failed_version)
@@ -340,26 +277,26 @@ class DependencyAgent:
         
         end_group()
         if best_working_version_index != -1:
-            return versions[best_working_version_index]
+            best_version = versions[best_working_version_index]
+            print(f"Binary Search SUCCESS: Found latest stable version to be {best_version}")
+            # Final success needs to be handled outside, this just finds the version
+            success, _, _ = self._try_install_and_validate(package, best_version, dynamic_constraints)
+            return best_version if success else None
         return None
 
     def get_all_versions_between(self, package_name, start_ver_str, end_ver_str):
         try:
             package_info = self.pypi.get_project_page(package_name)
             if not (package_info and package_info.packages): return []
-            
             start_v = parse_version(start_ver_str)
             end_v = parse_version(end_ver_str)
-            
             candidate_versions = []
             for p in package_info.packages:
                 if p.version:
                     try:
                         v = parse_version(p.version)
-                        if start_v <= v < end_v:
-                            candidate_versions.append(v)
-                    except: continue # Ignore unparseable versions
-            
+                        if start_v <= v < end_v: candidate_versions.append(v)
+                    except: continue
             return sorted([str(v) for v in set(candidate_versions)], key=parse_version)
         except Exception:
             return []
@@ -374,7 +311,7 @@ class DependencyAgent:
 The packages I tried to install are: {requirements_list}.
 Provide a new, corrected list of packages that resolves this conflict. The new list MUST include all original packages. Your response format must be ONLY a Python list of strings. Example: ['numpy<2.0', 'pandas==2.2.0']"""
         try:
-            response = llm.generate_content(prompt)
+            response = self.llm.generate_content(prompt)
             response_text = response.text.strip()
             match = re.search(r'(\[.*?\])', response_text, re.DOTALL)
             if not match: return None
@@ -387,28 +324,24 @@ Provide a new, corrected list of packages that resolves this conflict. The new l
         except ResourceExhausted:
             self.llm_available = False
             return None
-        except Exception as e:
+        except Exception:
             return None
 
     def _ask_llm_for_root_cause(self, package, error_message):
         if not self.llm_available: return {}
         prompt = f"Analyze the Python error that occurred when updating '{package}'. Error: --- {error_message} --- Respond in JSON with 'root_cause': ('self' or 'incompatibility'), and if 'incompatibility', also 'package': 'package_name' and 'suggested_constraint': '<version'."
         try:
-            response = llm.generate_content(prompt)
+            response = self.llm.generate_content(prompt)
             json_text = re.search(r'\{.*\}', response.text, re.DOTALL).group(0)
             return json.loads(json_text)
         except Exception: return {}
 
     def _ask_llm_for_version_candidates(self, package, failed_version, error_message):
         if not self.llm_available: return []
-        prompt = f"The python package '{package}' version '{failed_version}' failed validation on Python 3.9. Error: ---{error_message}--- Based on this, give a Python list of the {MAX_BACKTRACK_ATTEMPTS} most recent, previous versions that are most likely to be stable, in descending order. Respond ONLY with the list."
+        prompt = f"The python package '{package}' version '{failed_version}' failed validation on Python 3.9. Error: ---{error_message}--- Based on this, give a Python list of the {self.config['MAX_LLM_BACKTRACK_ATTEMPTS']} most recent, previous versions that are most likely to be stable, in descending order. Respond ONLY with the list."
         try:
-            response = llm.generate_content(prompt)
+            response = self.llm.generate_content(prompt)
             match = re.search(r'(\[.*?\])', response.text, re.DOTALL)
             if not match: return []
             return ast.literal_eval(match.group(1))
         except Exception: return []
-
-if __name__ == "__main__":
-    agent = DependencyAgent()
-    agent.run()

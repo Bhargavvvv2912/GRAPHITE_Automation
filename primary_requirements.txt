@@ -14,3 +14,4 @@ Pillow
 python-Levenshtein
 google-generativeai
 pypi-simple
+packaging

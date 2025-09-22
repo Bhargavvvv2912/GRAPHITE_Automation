@@ -9,7 +9,6 @@ jobs:
   update-dependencies:
     runs-on: ubuntu-latest
     
-    # This 'defaults' block ensures all 'run' commands execute in the root of the workspace.
     defaults:
       run:
         working-directory: ${{ github.workspace }}
@@ -18,40 +17,50 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Debug - Verify File Path
-        run: |
-          echo "Current directory: $(pwd)"
-          echo "Workspace content:"
-          ls -R
-
       - name: Set up Python 3.9
         uses: actions/setup-python@v5
         with:
           python-version: '3.9'
 
       - name: Install agent dependencies
-        run: pip install google-generativeai pypi-simple
+        run: pip install google-generativeai pypi-simple packaging
 
       - name: Run the Autonomous Agent
-        run: python update_dependency.py
+        run: python dependency_agent.py
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
       
       - name: Commit and push changes if any
         run: |
-          # The logic to commit and push remains the same
           git config --global user.name 'Dependency Agent'
           git config --global user.email 'agent@users.noreply.github.com'
-          if ! git diff --quiet requirements.txt; then
-            echo "Dependencies updated. Committing changes."
-            git add requirements.txt
-            git commit -m "chore(deps): update dependencies via autonomous agent"
-            git push
-          else
+          
+          # Check if either of the agent-managed files have changed
+          if ! git diff --quiet requirements.txt && ! git diff --quiet metrics_history.json; then
             echo "No dependency changes to commit."
+            exit 0
           fi
+          
+          echo "Dependencies updated. Committing changes with metrics."
+          
+          COMMIT_BODY="Performance metrics for the new dependency set."
+          if [ -f metrics_output.txt ]; then
+            COMMIT_BODY=$(cat metrics_output.txt)
+          fi
+          
+          # Add both requirements.txt and the history file to the commit
+          git add requirements.txt metrics_history.json
+          
+          # Use [skip ci] to prevent infinite loops
+          git commit -m "chore(deps): Autonomously update dependencies [skip ci]" -m "$COMMIT_BODY"
+          
+          # Clean up the temporary metrics file
+          rm -f metrics_output.txt
+
+          git push
 
   validate-on-other-versions:
+    # This job only runs if the main job made a commit, which means this check is implicitly handled.
     needs: update-dependencies
     runs-on: ubuntu-latest
     defaults:
