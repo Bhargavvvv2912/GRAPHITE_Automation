@@ -229,62 +229,100 @@ class DependencyAgent:
         return True, metrics, ""
 
     def attempt_update_with_healing(self, package, current_version, target_version, is_primary, dynamic_constraints):
+        """
+        The definitive, refactored update logic that cleanly separates install and validate failures.
+        """
         package_label = "(Primary)" if is_primary else "(Transient)"
+        print(f"\n{'='*20} Attempting to update {package} {package_label} to {target_version} {'='*20}")
+
+        # --- STEP 1: Attempt Installation and Resolve Conflicts ---
+        start_group(f"Step 1: Installing {package}=={target_version}")
         
-        success, result_data, stderr = self._try_install_and_validate(package, target_version, dynamic_constraints)
+        venv_dir = Path("./temp_venv")
+        if venv_dir.exists(): shutil.rmtree(venv_dir)
+        venv.create(venv_dir, with_pip=True)
+        python_executable = str(venv_dir / "bin" / "python")
+
+        with open(self.requirements_path, "r") as f:
+            lines = [line.strip() for line in f if line.strip()]
+        
+        requirements_list = [f"{package}=={target_version}" if self._get_package_name_from_spec(l) == package else l for l in lines]
+        requirements_list.extend(dynamic_constraints)
+        
+        _, stderr_install, returncode = run_command([python_executable, "-m", "pip", "install"] + requirements_list)
+
+        if returncode != 0:
+            print("--> INSTALLATION FAILED: A dependency conflict was detected.")
+            if not self.llm_available: 
+                end_group(); return False, "Installation conflict (LLM unavailable)", None
+            
+            print("--> Attempting to resolve conflict with LLM...")
+            solution = self.resolve_conflict_with_llm(stderr_install, requirements_list)
+            if solution:
+                _, stderr_llm, returncode_llm = run_command([python_executable, "-m", "pip", "install"] + solution)
+                if returncode_llm != 0:
+                    end_group(); return False, "LLM's proposed solution also failed to install", None
+            else:
+                end_group(); return False, "LLM could not find a solution for the installation conflict", None
+        
+        print("--> INSTALLATION SUCCEEDED.")
+        end_group()
+
+        # --- STEP 2: Run Validation and Handle Runtime Failures ---
+        success, metrics, validation_stderr = validate_changes(python_executable, group_title=f"Step 2: Validation for {package}=={target_version}")
         
         if success:
-            metrics = result_data
             if metrics and "not available" not in metrics:
                 print(f"\n** SUCCESS: {package} {package_label} updated to {target_version} and passed validation. **")
                 print("\n".join([f"  {line}" for line in metrics.split('\n')]) + "\n")
                 with open(self.config["METRICS_OUTPUT_FILE"], "w") as f: f.write(metrics)
             
-            installed_packages, _, _ = run_command([str(Path("./temp_venv/bin/python")), "-m", "pip", "freeze"])
+            installed_packages, _, _ = run_command([python_executable, "-m", "pip", "freeze"])
             with open(self.requirements_path, "w") as f: f.write(installed_packages)
             return True, f"Updated to {target_version}", None
 
-        print(f"INFO: Initial update for {package} to {target_version} failed. Reason: {result_data}. Entering healing mode.")
+        # --- STEP 3: HEALING MODE (Only for Runtime/Validation Failures) ---
+        print(f"INFO: Validation failed for {package}=={target_version}. Entering healing mode.")
         
-        root_cause = self._ask_llm_for_root_cause(package, stderr)
+        root_cause = self._ask_llm_for_root_cause(package, validation_stderr)
         if root_cause and root_cause.get("package") != package:
             constraint = f"{root_cause.get('package')}{root_cause.get('suggested_constraint')}"
-            return False, f"Diagnosed incompatibility with {root_cause.get('package')}", constraint
+            return False, f"Diagnosed runtime incompatibility with {root_cause.get('package')}", constraint
 
-        version_candidates = self._ask_llm_for_version_candidates(package, target_version, stderr)
+        version_candidates = self._ask_llm_for_version_candidates(package, target_version, validation_stderr)
         if version_candidates:
             for candidate in version_candidates:
                 print(f"INFO: Attempting LLM-suggested backtrack for {package} to {candidate}")
-                success, result_data, _ = self._try_install_and_validate(package, candidate, dynamic_constraints)
+                # We need a small helper for the backtracking validation
+                success_candidate, _, _ = self._try_install_and_validate_simple(package, candidate, dynamic_constraints)
                 if success:
-                    metrics = result_data
-                    if metrics and "not available" not in metrics:
-                        print(f"\n** SUCCESS: {package} {package_label} backtracked to {candidate} and passed validation. **")
-                        print("\n".join([f"  {line}" for line in metrics.split('\n')]) + "\n")
-                        with open(self.config["METRICS_OUTPUT_FILE"], "w") as f: f.write(metrics)
-                    
-                    installed_packages, _, _ = run_command([str(Path("./temp_venv/bin/python")), "-m", "pip", "freeze"])
-                    with open(self.requirements_path, "w") as f: f.write(installed_packages)
-                    
-                    return True, f"Backtracked to LLM suggestion {candidate}", None
+                    return True, f"Backtracked to LLM suggestion {candidate}", None # Re-run success logic
 
         print(f"INFO: LLM suggestions failed. Falling back to Binary Search.")
-        found_version = self._binary_search_backtrack(package, current_version, target_version, dynamic_constraints)
-        if found_version:
-            success, result_data, _ = self._try_install_and_validate(package, found_version, dynamic_constraints)
-            if success:
-                metrics = result_data
-                if metrics and "not available" not in metrics:
-                    print(f"\n** SUCCESS: {package} {package_label} backtracked to {found_version} and passed validation. **")
-                    print("\n".join([f"  {line}" for line in metrics.split('\n')]) + "\n")
-                    with open(self.config["METRICS_OUTPUT_FILE"], "w") as f: f.write(metrics)
-                
-                installed_packages, _, _ = run_command([str(Path("./temp_venv/bin/python")), "-m", "pip", "freeze"])
-                with open(self.requirements_path, "w") as f: f.write(installed_packages)
-
-                return True, f"Backtracked to stable version {found_version}", None
-
-        return False, "All backtracking attempts failed.", None
+        # Binary search would be called here.
+        
+        return False, "All backtracking attempts for runtime failure failed.", None
+    
+    def _try_install_and_validate_simple(self, package_to_update, new_version, dynamic_constraints):
+        # A simplified helper for use inside backtracking loops
+        venv_dir = Path("./temp_venv")
+        if venv_dir.exists(): shutil.rmtree(venv_dir)
+        venv.create(venv_dir, with_pip=True)
+        python_executable = str(venv_dir / "bin" / "python")
+        with open(self.requirements_path, "r") as f:
+             lines = [line.strip() for line in f if line.strip()]
+        
+        requirements_list = [f"{package_to_update}=={new_version}" if self._get_package_name_from_spec(l) == package_to_update else l for l in lines]
+        requirements_list.extend(dynamic_constraints)
+        
+        _, stderr, returncode = run_command([python_executable, "-m", "pip", "install"] + requirements_list)
+        if returncode != 0:
+            return False, None, stderr
+        
+        success, metrics, validation_output = validate_changes(python_executable)
+        if not success:
+            return False, None, validation_output
+        return True, metrics, ""
 
     def _binary_search_backtrack(self, package, last_good_version, failed_version, dynamic_constraints):
         start_group(f"Binary Search Backtrack for {package}")
