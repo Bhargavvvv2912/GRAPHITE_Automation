@@ -29,7 +29,6 @@ class DependencyAgent:
         repo_root = Path('.')
         print("Scanning all .py files for import statements...")
         for py_file in repo_root.rglob('*.py'):
-            # Avoid scanning the agent's own venvs and code
             if any(part in str(py_file) for part in ['temp_venv', 'final_venv', 'bootstrap_venv', 'agent_logic.py', 'agent_utils.py', 'dependency_agent.py']):
                 continue
             try:
@@ -46,8 +45,7 @@ class DependencyAgent:
                                 module_name = node.module.split('.')[0]
                                 scores[module_name] = scores.get(module_name, 0) + 1
             except Exception:
-                continue # Ignore files that cannot be parsed
-        
+                continue
         normalized_scores = {name.replace('_', '-'): score for name, score in scores.items()}
         print("Usage scores calculated.")
         end_group()
@@ -70,30 +68,20 @@ class DependencyAgent:
         return all('==' in line for line in lines), lines
 
     def _bootstrap_unpinned_requirements(self):
-        print("Unpinned requirements detected. Attempting to create a stable baseline...")
+        print("Unpinned requirements detected. Creating a stable baseline...")
         venv_dir = Path("./bootstrap_venv");
         if venv_dir.exists(): shutil.rmtree(venv_dir)
         venv.create(venv_dir, with_pip=True)
         python_executable = str(venv_dir / "bin" / "python")
-        
-        print("\nStep 1: Installing the latest compatible versions...")
         _, stderr, returncode = run_command([python_executable, "-m", "pip", "install", "-r", str(self.requirements_path)])
         if returncode != 0: sys.exit(f"CRITICAL ERROR: Failed to install initial set of dependencies. Error: {stderr}")
-        
-        print("\nStep 2: Validating the new baseline environment...")
         success, metrics, _ = validate_changes(python_executable, group_title="Running Validation on New Baseline")
         if not success: sys.exit("CRITICAL ERROR: Initial dependencies failed validation.")
-        
-        print("\nStep 3: Freezing the validated environment to requirements.txt...")
-        installed_packages, stderr_freeze, returncode_freeze = run_command([python_executable, "-m", "pip", "freeze"])
-        if returncode_freeze != 0: sys.exit(f"CRITICAL ERROR: Failed to 'pip freeze' the new environment. Error: {stderr_freeze}")
-        
-        with open(self.requirements_path, "w") as f: f.write(installed_packages)
-        print("\nSuccessfully created and froze a new, stable requirements.txt.")
-        start_group("View new requirements.txt content"); print(installed_packages); end_group()
-
         if metrics and "not available" not in metrics:
             print(f"\n{'='*70}\n=== BOOTSTRAP SUCCESSFUL: METRICS FOR THE NEW BASELINE ===\n" + "\n".join([f"  {line}" for line in metrics.split('\n')]) + f"\n{'='*70}\n")
+        installed_packages, _, _ = run_command([python_executable, "-m", "pip", "freeze"])
+        with open(self.requirements_path, "w") as f: f.write(installed_packages)
+        if metrics:
             with open(self.config["METRICS_OUTPUT_FILE"], "w") as f: f.write(metrics)
 
     def run(self):
@@ -142,10 +130,10 @@ class DependencyAgent:
                 
                 if success:
                     updates_made_this_pass = True
-                    final_successful_updates[package] = reason
+                    final_successful_updates[package] = (target_ver, reason)
                     if package in final_failed_updates: del final_failed_updates[package]
                 else:
-                    final_failed_updates[package] = reason
+                    final_failed_updates[package] = (target_ver, reason)
                     if learned_constraint and learned_constraint not in dynamic_constraints:
                         print(f"DIAGNOSIS: Learned new global constraint '{learned_constraint}' from failure of {package}.")
                         dynamic_constraints.append(learned_constraint)
@@ -161,34 +149,49 @@ class DependencyAgent:
                 print("\nNo successful updates in this pass. System is stable.")
                 break
 
-        if final_successful_updates or final_failed_updates:
-            print("\n" + "#"*70); print("### OVERALL UPDATE RUN SUMMARY ###")
-            if final_successful_updates:
-                print("\n[SUCCESS] The following packages were updated:")
-                for pkg, reason in final_successful_updates.items(): print(f"- {pkg}: {reason}")
-            if final_failed_updates:
-                print("\n[FAILURE] Updates were attempted but FAILED for:")
-                for pkg, reason in final_failed_updates.items(): print(f"- {pkg}: {reason}")
-            print("#"*70 + "\n")
+        self._print_final_summary(final_successful_updates, final_failed_updates)
 
         if final_successful_updates:
-            print("\n" + "#"*70); print("### FINAL SYSTEM HEALTH CHECK ###"); print("#"*70 + "\n")
-            venv_dir = Path("./final_venv")
-            if venv_dir.exists(): shutil.rmtree(venv_dir)
-            venv.create(venv_dir, with_pip=True)
-            python_executable = str(venv_dir / "bin" / "python")
-            _, stderr, returncode = run_command([python_executable, "-m", "pip", "install", "-r", str(self.requirements_path)])
-            if returncode != 0:
-                print("CRITICAL ERROR: Final installation of combined dependencies failed!", file=sys.stderr); return
-            success, metrics, _ = validate_changes(python_executable, group_title="Final System Health Check")
-            if success and metrics and "not available" not in metrics:
-                print("\n" + "="*70); print("=== FINAL METRICS FOR THE FULLY UPDATED ENVIRONMENT ===")
-                indented_metrics = "\n".join([f"  {line}" for line in metrics.split('\n')])
-                print(indented_metrics); print("="*70)
-            elif success:
-                print("\n" + "="*70); print("=== Final validation passed, but metrics were not available in output. ==="); print("="*70)
-            else:
-                print("\n" + "!"*70); print("!!! CRITICAL ERROR: Final validation of combined dependencies failed! !!!"); print("!"*70)
+            self._run_final_health_check()
+
+    def _print_final_summary(self, successful, failed):
+        print("\n" + "#"*70); print("### OVERALL UPDATE RUN SUMMARY ###")
+        
+        if successful:
+            print("\n[SUCCESS] The following packages were successfully updated:")
+            print(f"{'Package':<30} | {'Target Version':<20} | {'Reached Version':<20}")
+            print(f"{'-'*30} | {'-'*20} | {'-'*20}")
+            for pkg, (target_ver, reason) in successful.items():
+                version = reason
+                print(f"{pkg:<30} | {target_ver:<20} | {version:<20}")
+        
+        if failed:
+            print("\n[FAILURE] Updates were attempted but FAILED for:")
+            print(f"{'Package':<30} | {'Target Version':<20} | {'Reason for Failure'}")
+            print(f"{'-'*30} | {'-'*20} | {'-'*40}")
+            for pkg, (target_ver, reason) in failed.items():
+                print(f"{pkg:<30} | {target_ver:<20} | {reason}")
+        
+        print("#"*70 + "\n")
+
+    def _run_final_health_check(self):
+        print("\n" + "#"*70); print("### FINAL SYSTEM HEALTH CHECK ###"); print("#"*70 + "\n")
+        venv_dir = Path("./final_venv")
+        if venv_dir.exists(): shutil.rmtree(venv_dir)
+        venv.create(venv_dir, with_pip=True)
+        python_executable = str(venv_dir / "bin" / "python")
+        _, stderr, returncode = run_command([python_executable, "-m", "pip", "install", "-r", str(self.requirements_path)])
+        if returncode != 0:
+            print("CRITICAL ERROR: Final installation of combined dependencies failed!", file=sys.stderr); return
+        success, metrics, _ = validate_changes(python_executable, group_title="Final System Health Check")
+        if success and metrics and "not available" not in metrics:
+            print("\n" + "="*70); print("=== FINAL METRICS FOR THE FULLY UPDATED ENVIRONMENT ===")
+            indented_metrics = "\n".join([f"  {line}" for line in metrics.split('\n')])
+            print(indented_metrics); print("="*70)
+        elif success:
+            print("\n" + "="*70); print("=== Final validation passed, but metrics were not available in output. ==="); print("="*70)
+        else:
+            print("\n" + "!"*70); print("!!! CRITICAL ERROR: Final validation of combined dependencies failed! !!!"); print("!"*70)
 
     def get_latest_version(self, package_name):
         try:
@@ -198,13 +201,7 @@ class DependencyAgent:
             return max(stable_versions, key=parse_version) if stable_versions else max([p.version for p in package_info.packages if p.version], key=parse_version)
         except Exception: return None
 
-    # In agent_logic.py
-
     def _try_install_and_validate(self, package_to_update, new_version, dynamic_constraints):
-        """
-        The definitive version with clear, explicit logging for every step.
-        This function attempts a full install-and-validate cycle for a single target version.
-        """
         venv_dir = Path("./temp_venv")
         if venv_dir.exists(): shutil.rmtree(venv_dir)
         venv.create(venv_dir, with_pip=True)
@@ -216,62 +213,19 @@ class DependencyAgent:
         requirements_list = [f"{package_to_update}=={new_version}" if self._get_package_name_from_spec(l) == package_to_update else l for l in lines]
         requirements_list.extend(dynamic_constraints)
         
-        # --- First Installation Attempt ---
-        print(f"\n--> STEP 1: Attempting to install environment with {package_to_update}=={new_version}")
         _, stderr_install, returncode = run_command([python_executable, "-m", "pip", "install"] + requirements_list)
-        
         if returncode != 0:
-            print(f"--> STEP 1 FAILED: The initial installation attempt resulted in a dependency conflict.")
-            
-            if not self.llm_available: 
-                return False, "Installation conflict (LLM unavailable)", stderr_install
-            
-            # --- LLM Conflict Resolution Attempt ---
-            print("--> STEP 1.1: Asking LLM for a conflict resolution plan.")
-            solution = self.resolve_conflict_with_llm(stderr_install, requirements_list)
-            
-            if solution:
-                start_group("LLM's Proposed Solution")
-                print("The LLM suggested the following installation plan to resolve the conflict:")
-                for line in solution: print(f"- {line}")
-                end_group()
-                
-                print("\n--> STEP 1.2: Attempting to install the LLM's proposed solution.")
-                _, stderr_llm, returncode_llm = run_command([python_executable, "-m", "pip", "install"] + solution)
-                if returncode_llm != 0: 
-                    print("--> STEP 1.2 FAILED: The LLM's proposed solution also failed to install.")
-                    start_group("Reason for LLM Solution Failure")
-                    print(stderr_llm)
-                    end_group()
-                    return False, "LLM solution failed to install", stderr_llm
-            else:
-                print("--> STEP 1.1 FAILED: The LLM could not find a solution for the conflict.")
-                return False, "LLM could not find a solution", stderr_install
+            return False, "Installation conflict", stderr_install
         
-        print(f"--> STEP 1 SUCCESS: Successfully installed the environment.")
-        
-        # --- Validation Step ---
-        print(f"\n--> STEP 2: Running validation suite.")
         success, metrics, validation_output = validate_changes(python_executable, group_title=f"Validation for {package_to_update}=={new_version}")
-        
         if not success:
-            print(f"--> STEP 2 FAILED: The validation script failed.")
             return False, "Validation script failed", validation_output
-
-        print(f"--> STEP 2 SUCCESS: Validation passed.")
+        
         return True, metrics, ""
 
-    # In agent_logic.py, replace the entire old function with this one.
-
     def attempt_update_with_healing(self, package, current_version, target_version, is_primary, dynamic_constraints):
-        """
-        The definitive, final version with a UNIFIED failure response.
-        It no longer tries to diagnose the root cause and instead always
-        triggers the full backtracking process for the target package.
-        """
         package_label = "(Primary)" if is_primary else "(Transient)"
         
-        # This first attempt is still the "happy path".
         success, result_data, stderr = self._try_install_and_validate(package, target_version, dynamic_constraints)
         
         if success:
@@ -283,56 +237,47 @@ class DependencyAgent:
             
             installed_packages, _, _ = run_command([str(Path("./temp_venv/bin/python")), "-m", "pip", "freeze"])
             with open(self.requirements_path, "w") as f: f.write(installed_packages)
-            # On success, we no longer return a learned constraint (it's always None).
-            return True, f"Updated to {target_version}", None
+            return True, target_version, None
 
-        # --- HEALING MODE (TRIGGERED BY *ANY* FAILURE) ---
         print(f"INFO: Initial update for {package} to {target_version} failed. Reason: '{result_data}'. Entering unified healing mode.")
         
-        # THE ROOT CAUSE ANALYSIS STEP IS NOW COMPLETELY REMOVED.
-        # We proceed directly to backtracking the target package.
-        
+        root_cause = self._ask_llm_for_root_cause(package, stderr)
+        if root_cause and root_cause.get("package") != package:
+            constraint = f"{root_cause.get('package')}{root_cause.get('suggested_constraint')}"
+            return False, f"Diagnosed incompatibility with {root_cause.get('package')}", constraint
+
         version_candidates = self._ask_llm_for_version_candidates(package, target_version, stderr)
         if version_candidates:
             for candidate in version_candidates:
                 print(f"INFO: Attempting LLM-suggested backtrack for {package} to {candidate}")
-                # We use the simple helper here, as we only care about pass/fail for now.
-                success, _, _ = self._try_install_and_validate(package, candidate, dynamic_constraints)
+                success, result_data, _ = self._try_install_and_validate(package, candidate, dynamic_constraints)
                 if success:
-                    # If an LLM guess works, we must re-run the success logic to capture metrics and freeze the state.
-                    print(f"INFO: LLM-suggested version {candidate} passed validation. Finalizing state.")
-                    # We call the main helper again to ensure a clean final state and metrics capture.
-                    final_success, final_metrics, _ = self._try_install_and_validate(package, candidate, dynamic_constraints)
-                    if final_success:
-                        # Full success block handling
-                        if final_metrics and "not available" not in final_metrics:
-                           print(f"\n** SUCCESS: {package} {package_label} backtracked to {candidate} and passed validation. **")
-                           print("\n".join([f"  {line}" for line in final_metrics.split('\n')]) + "\n")
-                           with open(self.config["METRICS_OUTPUT_FILE"], "w") as f: f.write(final_metrics)
-                        
-                        installed_packages, _, _ = run_command([str(Path("./temp_venv/bin/python")), "-m", "pip", "freeze"])
-                        with open(self.requirements_path, "w") as f: f.write(installed_packages)
-                        return True, f"Backtracked to LLM suggestion {candidate}", None
+                    metrics = result_data
+                    if metrics and "not available" not in metrics:
+                        print(f"\n** SUCCESS: {package} {package_label} backtracked to {candidate} and passed validation. **")
+                        print("\n".join([f"  {line}" for line in metrics.split('\n')]) + "\n")
+                        with open(self.config["METRICS_OUTPUT_FILE"], "w") as f: f.write(metrics)
+                    
+                    installed_packages, _, _ = run_command([str(Path("./temp_venv/bin/python")), "-m", "pip", "freeze"])
+                    with open(self.requirements_path, "w") as f: f.write(installed_packages)
+                    
+                    return True, candidate, None
 
-        print(f"INFO: LLM suggestions failed or were not attempted. Falling back to Binary Search.")
+        print(f"INFO: LLM suggestions failed for {package}. Falling back to Binary Search.")
         found_version = self._binary_search_backtrack(package, current_version, target_version, dynamic_constraints)
-        
         if found_version:
-            # Similar to above, we must run a final validation on the version found by the search.
-            print(f"INFO: Binary search found stable version {found_version}. Finalizing state.")
-            final_success, final_metrics, _ = self._try_install_and_validate(package, found_version, dynamic_constraints)
-            if final_success:
-                if final_metrics and "not available" not in final_metrics:
+            success, result_data, _ = self._try_install_and_validate(package, found_version, dynamic_constraints)
+            if success:
+                metrics = result_data
+                if metrics and "not available" not in metrics:
                     print(f"\n** SUCCESS: {package} {package_label} backtracked to {found_version} and passed validation. **")
-                    print("\n".join([f"  {line}" for line in final_metrics.split('\n')]) + "\n")
-                    with open(self.config["METRICS_OUTPUT_FILE"], "w") as f: f.write(final_metrics)
+                    print("\n".join([f"  {line}" for line in metrics.split('\n')]) + "\n")
+                    with open(self.config["METRICS_OUTPUT_FILE"], "w") as f: f.write(metrics)
                 
                 installed_packages, _, _ = run_command([str(Path("./temp_venv/bin/python")), "-m", "pip", "freeze"])
                 with open(self.requirements_path, "w") as f: f.write(installed_packages)
+                return True, found_version, None
 
-                return True, f"Backtracked to stable version {found_version}", None
-
-        # If we get here, absolutely every attempt has failed.
         return False, "All backtracking attempts failed.", None
 
     def _binary_search_backtrack(self, package, last_good_version, failed_version, dynamic_constraints):
@@ -347,22 +292,22 @@ class DependencyAgent:
         while low <= high:
             mid = (low + high) // 2
             test_version = versions[mid]
-            print(f"Binary Search: Testing version {test_version}...")
+            print(f"Binary Search: Probing version {test_version}...")
             
             success, _, _ = self._try_install_and_validate(package, test_version, dynamic_constraints)
             
             if success:
-                print(f"Binary Search: Version {test_version} PASSED validation.")
+                print(f"Binary Search: Version {test_version} PASSED probe.")
                 best_working_version = test_version
                 low = mid + 1
             else:
-                print(f"Binary Search: Version {test_version} FAILED validation.")
                 high = mid - 1
         
         end_group()
         if best_working_version:
             print(f"Binary Search SUCCESS: Found latest stable version to be {best_working_version}")
             return best_working_version
+        print(f"Binary Search FAILED: No stable version was found for {package}.")
         return None
 
     def get_all_versions_between(self, package_name, start_ver_str, end_ver_str):
