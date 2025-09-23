@@ -68,20 +68,36 @@ class DependencyAgent:
         return all('==' in line for line in lines), lines
 
     def _bootstrap_unpinned_requirements(self):
-        print("Unpinned requirements detected. Creating a stable baseline...")
+        """
+        MODIFIED: This version now correctly includes the final log group showing the new file content.
+        """
+        print("Unpinned requirements detected. Attempting to create a stable baseline...")
         venv_dir = Path("./bootstrap_venv");
         if venv_dir.exists(): shutil.rmtree(venv_dir)
         venv.create(venv_dir, with_pip=True)
         python_executable = str(venv_dir / "bin" / "python")
+        
+        print("\nStep 1: Installing the latest compatible versions...")
         _, stderr, returncode = run_command([python_executable, "-m", "pip", "install", "-r", str(self.requirements_path)])
         if returncode != 0: sys.exit(f"CRITICAL ERROR: Failed to install initial set of dependencies. Error: {stderr}")
+        
+        print("\nStep 2: Validating the new baseline environment...")
         success, metrics, _ = validate_changes(python_executable, group_title="Running Validation on New Baseline")
         if not success: sys.exit("CRITICAL ERROR: Initial dependencies failed validation.")
+        
+        print("\nStep 3: Freezing the validated environment to requirements.txt...")
+        installed_packages, stderr_freeze, returncode_freeze = run_command([python_executable, "-m", "pip", "freeze"])
+        if returncode_freeze != 0: sys.exit(f"CRITICAL ERROR: Failed to 'pip freeze' the new environment. Error: {stderr_freeze}")
+        
+        with open(self.requirements_path, "w") as f: f.write(installed_packages)
+        print("\nSuccessfully created and froze a new, stable requirements.txt.")
+
+        start_group("View new requirements.txt content")
+        print(installed_packages)
+        end_group()
+
         if metrics and "not available" not in metrics:
             print(f"\n{'='*70}\n=== BOOTSTRAP SUCCESSFUL: METRICS FOR THE NEW BASELINE ===\n" + "\n".join([f"  {line}" for line in metrics.split('\n')]) + f"\n{'='*70}\n")
-        installed_packages, _, _ = run_command([python_executable, "-m", "pip", "freeze"])
-        with open(self.requirements_path, "w") as f: f.write(installed_packages)
-        if metrics:
             with open(self.config["METRICS_OUTPUT_FILE"], "w") as f: f.write(metrics)
 
     def run(self):
