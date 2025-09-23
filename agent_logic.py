@@ -68,36 +68,21 @@ class DependencyAgent:
         return all('==' in line for line in lines), lines
 
     def _bootstrap_unpinned_requirements(self):
-        """
-        MODIFIED: This version now correctly includes the final log group showing the new file content.
-        """
-        print("Unpinned requirements detected. Attempting to create a stable baseline...")
+        print("Unpinned requirements detected. Creating a stable baseline...")
         venv_dir = Path("./bootstrap_venv");
         if venv_dir.exists(): shutil.rmtree(venv_dir)
         venv.create(venv_dir, with_pip=True)
         python_executable = str(venv_dir / "bin" / "python")
-        
-        print("\nStep 1: Installing the latest compatible versions...")
         _, stderr, returncode = run_command([python_executable, "-m", "pip", "install", "-r", str(self.requirements_path)])
         if returncode != 0: sys.exit(f"CRITICAL ERROR: Failed to install initial set of dependencies. Error: {stderr}")
-        
-        print("\nStep 2: Validating the new baseline environment...")
         success, metrics, _ = validate_changes(python_executable, group_title="Running Validation on New Baseline")
         if not success: sys.exit("CRITICAL ERROR: Initial dependencies failed validation.")
-        
-        print("\nStep 3: Freezing the validated environment to requirements.txt...")
-        installed_packages, stderr_freeze, returncode_freeze = run_command([python_executable, "-m", "pip", "freeze"])
-        if returncode_freeze != 0: sys.exit(f"CRITICAL ERROR: Failed to 'pip freeze' the new environment. Error: {stderr_freeze}")
-        
-        with open(self.requirements_path, "w") as f: f.write(installed_packages)
-        print("\nSuccessfully created and froze a new, stable requirements.txt.")
-
-        start_group("View new requirements.txt content")
-        print(installed_packages)
-        end_group()
-
         if metrics and "not available" not in metrics:
             print(f"\n{'='*70}\n=== BOOTSTRAP SUCCESSFUL: METRICS FOR THE NEW BASELINE ===\n" + "\n".join([f"  {line}" for line in metrics.split('\n')]) + f"\n{'='*70}\n")
+        installed_packages, _, _ = run_command([python_executable, "-m", "pip", "freeze"])
+        with open(self.requirements_path, "w") as f: f.write(self._prune_pip_freeze(installed_packages))
+        start_group("View new requirements.txt content"); print(installed_packages); end_group()
+        if metrics:
             with open(self.config["METRICS_OUTPUT_FILE"], "w") as f: f.write(metrics)
 
     def run(self):
@@ -164,7 +149,7 @@ class DependencyAgent:
             if not updates_made_this_pass:
                 print("\nNo successful updates in this pass. System is stable.")
                 break
-
+        
         self._print_final_summary(final_successful_updates, final_failed_updates)
 
         if final_successful_updates:
@@ -177,8 +162,7 @@ class DependencyAgent:
             print("\n[SUCCESS] The following packages were successfully updated:")
             print(f"{'Package':<30} | {'Target Version':<20} | {'Reached Version':<20}")
             print(f"{'-'*30} | {'-'*20} | {'-'*20}")
-            for pkg, (target_ver, reason) in successful.items():
-                version = reason
+            for pkg, (target_ver, version) in successful.items():
                 print(f"{pkg:<30} | {target_ver:<20} | {version:<20}")
         
         if failed:
@@ -217,7 +201,7 @@ class DependencyAgent:
             return max(stable_versions, key=parse_version) if stable_versions else max([p.version for p in package_info.packages if p.version], key=parse_version)
         except Exception: return None
 
-    def _try_install_and_validate(self, package_to_update, new_version, dynamic_constraints):
+    def _try_install_and_validate(self, package_to_update, new_version, dynamic_constraints, old_version='N/A'):
         venv_dir = Path("./temp_venv")
         if venv_dir.exists(): shutil.rmtree(venv_dir)
         venv.create(venv_dir, with_pip=True)
@@ -229,9 +213,17 @@ class DependencyAgent:
         requirements_list = [f"{package_to_update}=={new_version}" if self._get_package_name_from_spec(l) == package_to_update else l for l in lines]
         requirements_list.extend(dynamic_constraints)
         
+        start_group(f"Attempting to install {package_to_update}=={new_version}")
+        
+        print(f"\nChange analysis: Updating '{package_to_update}' from {old_version} -> {new_version}")
+        
         _, stderr_install, returncode = run_command([python_executable, "-m", "pip", "install"] + requirements_list)
+        end_group()
+        
         if returncode != 0:
-            return False, "Installation conflict", stderr_install
+            llm_summary = self._ask_llm_to_summarize_error(stderr_install)
+            reason = f"Installation conflict. Summary: {llm_summary}"
+            return False, reason, stderr_install
         
         success, metrics, validation_output = validate_changes(python_executable, group_title=f"Validation for {package_to_update}=={new_version}")
         if not success:
@@ -239,10 +231,15 @@ class DependencyAgent:
         
         return True, metrics, ""
 
+
     def attempt_update_with_healing(self, package, current_version, target_version, is_primary, dynamic_constraints):
+        """
+        MODIFIED: Now uses the optimized result from the binary search
+        to avoid a redundant final validation run.
+        """
         package_label = "(Primary)" if is_primary else "(Transient)"
         
-        success, result_data, stderr = self._try_install_and_validate(package, target_version, dynamic_constraints)
+        success, result_data, stderr = self._try_install_and_validate(package, target_version, dynamic_constraints, old_version=current_version)
         
         if success:
             metrics = result_data
@@ -252,10 +249,13 @@ class DependencyAgent:
                 with open(self.config["METRICS_OUTPUT_FILE"], "w") as f: f.write(metrics)
             
             installed_packages, _, _ = run_command([str(Path("./temp_venv/bin/python")), "-m", "pip", "freeze"])
-            with open(self.requirements_path, "w") as f: f.write(installed_packages)
+            with open(self.requirements_path, "w") as f: f.write(self._prune_pip_freeze(installed_packages))
             return True, target_version, None
 
-        print(f"INFO: Initial update for {package} to {target_version} failed. Reason: '{result_data}'. Entering unified healing mode.")
+        print(f"\nINFO: Initial update for '{package}' from {current_version} -> {target_version} failed.")
+        print(f"  Reason: {result_data}")
+        start_group("View Full Error Log for Initial Failure"); print(stderr); end_group()
+        print("INFO: Entering unified healing mode.")
         
         root_cause = self._ask_llm_for_root_cause(package, stderr)
         if root_cause and root_cause.get("package") != package:
@@ -266,7 +266,7 @@ class DependencyAgent:
         if version_candidates:
             for candidate in version_candidates:
                 print(f"INFO: Attempting LLM-suggested backtrack for {package} to {candidate}")
-                success, result_data, _ = self._try_install_and_validate(package, candidate, dynamic_constraints)
+                success, result_data, _ = self._try_install_and_validate(package, candidate, dynamic_constraints, old_version=current_version)
                 if success:
                     metrics = result_data
                     if metrics and "not available" not in metrics:
@@ -275,55 +275,74 @@ class DependencyAgent:
                         with open(self.config["METRICS_OUTPUT_FILE"], "w") as f: f.write(metrics)
                     
                     installed_packages, _, _ = run_command([str(Path("./temp_venv/bin/python")), "-m", "pip", "freeze"])
-                    with open(self.requirements_path, "w") as f: f.write(installed_packages)
-                    
+                    with open(self.requirements_path, "w") as f: f.write(self._prune_pip_freeze(installed_packages))
                     return True, candidate, None
 
-        print(f"INFO: LLM suggestions failed for {package}. Falling back to Binary Search.")
-        found_version = self._binary_search_backtrack(package, current_version, target_version, dynamic_constraints)
-        if found_version:
-            success, result_data, _ = self._try_install_and_validate(package, found_version, dynamic_constraints)
-            if success:
-                metrics = result_data
-                if metrics and "not available" not in metrics:
-                    print(f"\n** SUCCESS: {package} {package_label} backtracked to {found_version} and passed validation. **")
-                    print("\n".join([f"  {line}" for line in metrics.split('\n')]) + "\n")
-                    with open(self.config["METRICS_OUTPUT_FILE"], "w") as f: f.write(metrics)
-                
-                installed_packages, _, _ = run_command([str(Path("./temp_venv/bin/python")), "-m", "pip", "freeze"])
-                with open(self.requirements_path, "w") as f: f.write(installed_packages)
-                return True, found_version, None
+        print(f"INFO: LLM suggestions failed. Falling back to Binary Search.")
+        success_package = self._binary_search_backtrack(package, current_version, target_version, dynamic_constraints)
+        
+        if success_package:
+            found_version = success_package["version"]
+            metrics = success_package["metrics"]
+            installed_packages = success_package["installed_packages"]
+
+            if metrics and "not available" not in metrics:
+                print(f"\n** SUCCESS: {package} {package_label} backtracked to {found_version} and passed validation. **")
+                print("\n".join([f"  {line}" for line in metrics.split('\n')]) + "\n")
+                with open(self.config["METRICS_OUTPUT_FILE"], "w") as f: f.write(metrics)
+            
+            with open(self.requirements_path, "w") as f: f.write(self._prune_pip_freeze(installed_packages))
+            return True, found_version, None
 
         return False, "All backtracking attempts failed.", None
 
+
     def _binary_search_backtrack(self, package, last_good_version, failed_version, dynamic_constraints):
+        """
+        MODIFIED: Now returns a full "success package" (dict) containing all the state
+        from the last successful probe, or None if no version worked.
+        """
         start_group(f"Binary Search Backtrack for {package}")
         
         versions = self.get_all_versions_between(package, last_good_version, failed_version)
         if not versions:
-            end_group(); return None
+            end_group()
+            print(f"Binary Search FAILED: No versions found between {last_good_version} and {failed_version}.")
+            return None
 
         low, high = 0, len(versions) - 1
-        best_working_version = None
+        best_working_result = None
+
         while low <= high:
             mid = (low + high) // 2
             test_version = versions[mid]
-            print(f"Binary Search: Probing version {test_version}...")
             
-            success, _, _ = self._try_install_and_validate(package, test_version, dynamic_constraints)
+            success, metrics_or_reason, stderr = self._try_install_and_validate(package, test_version, dynamic_constraints, old_version=last_good_version, is_probe=True)
             
             if success:
                 print(f"Binary Search: Version {test_version} PASSED probe.")
-                best_working_version = test_version
-                low = mid + 1
+                # Capture the complete state of this successful run
+                python_executable_in_venv = str(Path("./temp_venv/bin/python"))
+                installed_packages, _, _ = run_command([python_executable_in_venv, "-m", "pip", "freeze"])
+                
+                best_working_result = {
+                    "version": test_version,
+                    "metrics": metrics_or_reason,
+                    "installed_packages": installed_packages
+                }
+                low = mid + 1 # It worked, so look for an even newer version in the upper half
             else:
-                high = mid - 1
+                reason = metrics_or_reason
+                print(f"Binary Search: Version {test_version} FAILED probe. Reason: {reason}.")
+                high = mid - 1 # It failed, so the problem is in this version or newer
         
         end_group()
-        if best_working_version:
-            print(f"Binary Search SUCCESS: Found latest stable version to be {best_working_version}")
-            return best_working_version
-        print(f"Binary Search FAILED: No stable version was found for {package}.")
+        
+        if best_working_result:
+            print(f"Binary Search SUCCESS: Found latest stable version to be {best_working_result['version']}")
+            return best_working_result
+        
+        print(f"Binary Search FAILED: No stable version was found for {package} in the given range.")
         return None
 
     def get_all_versions_between(self, package_name, start_ver_str, end_ver_str):
@@ -332,17 +351,11 @@ class DependencyAgent:
             if not (package_info and package_info.packages): return []
             start_v = parse_version(start_ver_str)
             end_v = parse_version(end_ver_str)
-            candidate_versions = []
-            for p in package_info.packages:
-                if p.version:
-                    try:
-                        v = parse_version(p.version)
-                        if start_v <= v < end_v: candidate_versions.append(v)
-                    except: continue
+            candidate_versions = [v for p in package_info.packages if p.version and start_v <= (v := parse_version(p.version)) < end_v]
             return sorted([str(v) for v in set(candidate_versions)], key=parse_version)
         except Exception:
             return []
-            
+
     def resolve_conflict_with_llm(self, error_message, requirements_list):
         py_version = f"{sys.version_info.major}.{sys.version_info.minor}"
         original_packages = {self._get_package_name_from_spec(req) for req in requirements_list}
@@ -369,6 +382,19 @@ Provide a new, corrected list of packages that resolves this conflict. The new l
             return None
         except Exception:
             return None
+
+    def _ask_llm_to_summarize_error(self, error_message):
+        if not self.llm_available: return "(LLM unavailable due to quota)"
+        prompt = f"The following is a Python pip install error log. Please summarize the root cause of the conflict in a single, concise sentence. Error Log: --- {error_message} ---"
+        try:
+            response = self.llm.generate_content(prompt)
+            return response.text.strip().replace('\n', ' ')
+        except Exception:
+            return "Failed to get summary from LLM."
+            
+    def _prune_pip_freeze(self, freeze_output):
+        lines = freeze_output.strip().split('\n')
+        return "\n".join([line for line in lines if '==' in line and not line.startswith('-e')])
 
     def _ask_llm_for_root_cause(self, package, error_message):
         if not self.llm_available: return {}
