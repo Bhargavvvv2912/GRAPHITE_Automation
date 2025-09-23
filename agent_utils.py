@@ -2,7 +2,6 @@
 
 import subprocess
 import re
-import sys
 
 def start_group(title):
     """Starts a collapsible log group in GitHub Actions."""
@@ -50,6 +49,7 @@ def validate_changes(python_executable, group_title="Running Validation Script")
     ]
     stdout_py, stderr_py, returncode_py = run_command(validation_command, python_executable=python_executable)
 
+    # Always show the output for debugging and context
     print("\n--- Captured output from main.py ---")
     print(f"STDOUT:\n---\n{stdout_py}\n---")
     if stderr_py:
