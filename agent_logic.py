@@ -84,7 +84,12 @@ class DependencyAgent:
         if metrics:
             with open(self.config["METRICS_OUTPUT_FILE"], "w") as f: f.write(metrics)
 
+    # In agent_logic.py
+
     def run(self):
+        """
+        The definitive main orchestrator with the iterative refinement loop and enhanced pulse logging.
+        """
         if os.path.exists(self.config["METRICS_OUTPUT_FILE"]): os.remove(self.config["METRICS_OUTPUT_FILE"])
         is_pinned, _ = self._get_requirements_state()
         if not is_pinned:
@@ -96,6 +101,11 @@ class DependencyAgent:
         final_failed_updates = {}
         
         for pass_num in range(1, self.config["MAX_RUN_PASSES"] + 1):
+            # --- High-level "Pulse" log for the start of the pass ---
+            print("\n" + "*"*80)
+            print(f"PULSE: Starting Update Pass {pass_num}/{self.config['MAX_RUN_PASSES']}. Current Constraints: {dynamic_constraints}")
+            print("*"*80 + "\n")
+            
             start_group(f"UPDATE PASS {pass_num}/{self.config['MAX_RUN_PASSES']} (Constraints: {dynamic_constraints})")
             
             _, lines = self._get_requirements_state()
@@ -118,13 +128,20 @@ class DependencyAgent:
             
             packages_to_update.sort(key=lambda p: self.usage_scores.get(p[0], 0), reverse=True)
             print("\nPrioritized Update Plan for this Pass:")
-            for pkg, _, target_ver in packages_to_update:
+            total_updates_in_plan = len(packages_to_update)
+            for i, (pkg, _, target_ver) in enumerate(packages_to_update):
                 score = self.usage_scores.get(pkg, 0)
-                print(f"- {pkg} (Usage Score: {score}) -> {target_ver}")
+                print(f"  {i+1}/{total_updates_in_plan}: {pkg} (Usage Score: {score}) -> {target_ver}")
 
             updates_made_this_pass = False
             learned_a_new_constraint = False
-            for package, current_ver, target_ver in packages_to_update:
+            for i, (package, current_ver, target_ver) in enumerate(packages_to_update):
+                
+                # --- Per-module "Pulse" log ---
+                print("\n" + "-"*80)
+                print(f"PULSE: [PASS {pass_num} | ATTEMPT {i+1}/{total_updates_in_plan}] Processing '{package}'")
+                print("-"*80)
+                
                 is_primary = self._get_package_name_from_spec(package) in self.primary_packages
                 success, reason, learned_constraint = self.attempt_update_with_healing(package, current_ver, target_ver, is_primary, dynamic_constraints)
                 
