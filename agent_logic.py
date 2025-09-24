@@ -27,6 +27,7 @@ class DependencyAgent:
         start_group("Analyzing Codebase for Import Usage")
         scores = {}
         repo_root = Path('.')
+        print("Scanning all .py files for import statements...")
         for py_file in repo_root.rglob('*.py'):
             if any(part in str(py_file) for part in ['temp_venv', 'final_venv', 'bootstrap_venv', 'agent_logic.py', 'agent_utils.py', 'dependency_agent.py']):
                 continue
@@ -87,9 +88,6 @@ class DependencyAgent:
     # In agent_logic.py
 
     def run(self):
-        """
-        The definitive main orchestrator with the iterative refinement loop and enhanced pulse logging.
-        """
         if os.path.exists(self.config["METRICS_OUTPUT_FILE"]): os.remove(self.config["METRICS_OUTPUT_FILE"])
         is_pinned, _ = self._get_requirements_state()
         if not is_pinned:
@@ -101,13 +99,10 @@ class DependencyAgent:
         final_failed_updates = {}
         
         for pass_num in range(1, self.config["MAX_RUN_PASSES"] + 1):
-            # --- High-level "Pulse" log for the start of the pass ---
             print("\n" + "*"*80)
             print(f"PULSE: Starting Update Pass {pass_num}/{self.config['MAX_RUN_PASSES']}. Current Constraints: {dynamic_constraints}")
-            print("*"*80 + "\n")
-            
-            start_group(f"UPDATE PASS {pass_num}/{self.config['MAX_RUN_PASSES']} (Constraints: {dynamic_constraints})")
-            
+            print("*"*80 + "\n")    
+            start_group(f"UPDATE PASS {pass_num}/{self.config['MAX_RUN_PASSES']} (Constraints: {dynamic_constraints})")  
             _, lines = self._get_requirements_state()
             all_reqs = list(set(lines + dynamic_constraints))
             original_requirements = {self._get_package_name_from_spec(line): line for line in all_reqs}
@@ -375,10 +370,27 @@ class DependencyAgent:
     def resolve_conflict_with_llm(self, error_message, requirements_list):
         py_version = f"{sys.version_info.major}.{sys.version_info.minor}"
         original_packages = {self._get_package_name_from_spec(req) for req in requirements_list}
-        prompt = f"..." # You would fill in the full prompt here
+        prompt = f"""I am an automated script trying to resolve a Python dependency conflict for a project running on Python {py_version}. My attempt to install failed. The error was:
+---
+{error_message}
+---
+The packages I tried to install are: {requirements_list}.
+Provide a new, corrected list of packages that resolves this conflict. The new list MUST include all original packages. Your response format must be ONLY a Python list of strings. Example: ['numpy<2.0', 'pandas==2.2.0']"""
         try:
-            # Full implementation as before
-            pass
+            print(f"Sending prompt to LLM for conflict resolution (context: Python {py_version})...")
+            response = self.llm.generate_content(prompt)
+            response_text = response.text.strip()
+            match = re.search(r'(\[.*?\])', response_text, re.DOTALL)
+            if not match: return None
+            list_string = match.group(1)
+            solution_list = ast.literal_eval(list_string)
+            if not isinstance(solution_list, list): return None
+            solution_packages = {self._get_package_name_from_spec(req) for req in solution_list}
+            if original_packages != solution_packages: return None
+            return solution_list
+        except ResourceExhausted:
+            self.llm_available = False
+            return None
         except Exception:
             return None
 
@@ -397,16 +409,19 @@ class DependencyAgent:
 
     def _ask_llm_for_root_cause(self, package, error_message):
         if not self.llm_available: return {}
-        prompt = f"..."
+        prompt = f"Analyze the Python error that occurred when updating '{package}'. Error: --- {error_message} --- Respond in JSON with 'root_cause': ('self' or 'incompatibility'), and if 'incompatibility', also 'package': 'package_name' and 'suggested_constraint': '<version'."
         try:
-            # Full implementation as before
-            pass
+            response = self.llm.generate_content(prompt)
+            json_text = re.search(r'\{.*\}', response.text, re.DOTALL).group(0)
+            return json.loads(json_text)
         except Exception: return {}
 
     def _ask_llm_for_version_candidates(self, package, failed_version, error_message):
         if not self.llm_available: return []
-        prompt = f"... {self.config['MAX_LLM_BACKTRACK_ATTEMPTS']} ..."
+        prompt = f"The python package '{package}' version '{failed_version}' failed validation on Python 3.9. Error: ---{error_message}--- Based on this, give a Python list of the {self.config['MAX_LLM_BACKTRACK_ATTEMPTS']} most recent, previous versions that are most likely to be stable, in descending order. Respond ONLY with the list."
         try:
-            # Full implementation as before
-            pass
+            response = self.llm.generate_content(prompt)
+            match = re.search(r'(\[.*?\])', response.text, re.DOTALL)
+            if not match: return []
+            return ast.literal_eval(match.group(1))
         except Exception: return []

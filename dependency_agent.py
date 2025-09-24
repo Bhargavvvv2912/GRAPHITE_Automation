@@ -1,4 +1,3 @@
-# dependency_agent.py
 
 import os
 import sys
@@ -11,7 +10,7 @@ AGENT_CONFIG = {
     "PRIMARY_REQUIREMENTS_FILE": "primary_requirements.txt",
     "METRICS_OUTPUT_FILE": "metrics_output.txt",
     "MAX_LLM_BACKTRACK_ATTEMPTS": 3,
-    "MAX_RUN_PASSES": 3,
+    "MAX_RUN_PASSES": 1,
 }
 
 if __name__ == "__main__":
