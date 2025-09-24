@@ -186,7 +186,7 @@ class DependencyAgent:
         print("#"*70 + "\n")
 
     def _run_final_health_check(self):
-        print("\n" + "#"*70); print("### FINAL SYSTEM HEALTH CHECK ###"); print("#"*70 + "\n")
+        print("\n" + "#"*70); print("Combined dependencies validation"); print("#"*70 + "\n")
         venv_dir = Path("./final_venv")
         if venv_dir.exists(): shutil.rmtree(venv_dir)
         venv.create(venv_dir, with_pip=True)
@@ -202,7 +202,7 @@ class DependencyAgent:
         elif success:
             print("\n" + "="*70); print("=== Final validation passed, but metrics were not available in output. ==="); print("="*70)
         else:
-            print("\n" + "!"*70); print("!!! CRITICAL ERROR: Final validation of combined dependencies failed! !!!"); print("!"*70)
+            print("\n" + "!"*70); print("CRITICAL ERROR: Final validation of combined dependencies failed"); print("!"*70)
 
     def get_latest_version(self, package_name):
         try:
@@ -246,10 +246,6 @@ class DependencyAgent:
         return True, metrics, ""
     
     def attempt_update_with_healing(self, package, current_version, target_version, is_primary, dynamic_constraints):
-        """
-        MODIFIED: Now uses the optimized result from the binary search
-        to avoid a redundant final validation run.
-        """
         package_label = "(Primary)" if is_primary else "(Transient)"
         
         success, result_data, stderr = self._try_install_and_validate(package, target_version, dynamic_constraints, old_version=current_version)
@@ -310,10 +306,6 @@ class DependencyAgent:
         return False, "All backtracking attempts failed.", None
 
     def _binary_search_backtrack(self, package, last_good_version, failed_version, dynamic_constraints):
-        """
-        MODIFIED: Now returns a full "success package" (dict) containing all the state
-        from the last successful probe, or None if no version worked.
-        """
         start_group(f"Binary Search Backtrack for {package}")
         
         versions = self.get_all_versions_between(package, last_good_version, failed_version)
@@ -333,7 +325,7 @@ class DependencyAgent:
             
             if success:
                 print(f"Binary Search: Version {test_version} PASSED probe.")
-                # Capture the complete state of this successful run
+
                 python_executable_in_venv = str(Path("./temp_venv/bin/python"))
                 installed_packages, _, _ = run_command([python_executable_in_venv, "-m", "pip", "freeze"])
                 
@@ -346,14 +338,11 @@ class DependencyAgent:
             else:
                 reason = metrics_or_reason
                 print(f"Binary Search: Version {test_version} FAILED probe. Reason: {reason}.")
-                high = mid - 1 # It failed, so the problem is in this version or newer
-        
-        end_group()
-        
+                high = mid - 1 # It failed, so the problem is in this version or newer   
+        end_group()  
         if best_working_result:
             print(f"Binary Search SUCCESS: Found latest stable version to be {best_working_result['version']}")
-            return best_working_result
-        
+            return best_working_result    
         print(f"Binary Search FAILED: No stable version was found for {package} in the given range.")
         return None
 
