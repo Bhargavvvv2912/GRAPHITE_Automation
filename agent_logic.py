@@ -356,36 +356,20 @@ class DependencyAgent:
         except Exception:
             return []
             
-    def resolve_conflict_with_llm(self, error_message, requirements_list):
-        py_version = f"{sys.version_info.major}.{sys.version_info.minor}"
-        original_packages = {self._get_package_name_from_spec(req) for req in requirements_list}
-        prompt = f"""I am an automated script trying to resolve a Python dependency conflict for a project running on Python {py_version}. My attempt to install failed. The error was:
----
-{error_message}
----
-The packages I tried to install are: {requirements_list}.
-Provide a new, corrected list of packages that resolves this conflict. The new list MUST include all original packages. Your response format must be ONLY a Python list of strings. Example: ['numpy<2.0', 'pandas==2.2.0']"""
-        try:
-            print(f"Sending prompt to LLM for conflict resolution (context: Python {py_version})...")
-            response = self.llm.generate_content(prompt)
-            response_text = response.text.strip()
-            match = re.search(r'(\[.*?\])', response_text, re.DOTALL)
-            if not match: return None
-            list_string = match.group(1)
-            solution_list = ast.literal_eval(list_string)
-            if not isinstance(solution_list, list): return None
-            solution_packages = {self._get_package_name_from_spec(req) for req in solution_list}
-            if original_packages != solution_packages: return None
-            return solution_list
-        except ResourceExhausted:
-            self.llm_available = False
-            return None
-        except Exception:
-            return None
 
     def _ask_llm_to_summarize_error(self, error_message):
         if not self.llm_available: return "(LLM unavailable due to quota)"
-        prompt = f"The following is a Python pip install error log. Please summarize the root cause of the conflict in a single, concise sentence. Error Log: --- {error_message} ---"
+        prompt = f"""
+You are an expert Python developer assisting a junior developer.
+A `pip install` command failed with a long and complex error log. Your job is to summarize the root cause of the conflict in a single, human-readable sentence. Be concise and clear.
+
+# PIP ERROR LOG
+---
+{error_message}
+---
+
+# YOUR SUMMARY (one sentence):
+"""
         try:
             response = self.llm.generate_content(prompt)
             return response.text.strip().replace('\n', ' ')
@@ -396,9 +380,44 @@ Provide a new, corrected list of packages that resolves this conflict. The new l
         lines = freeze_output.strip().split('\n')
         return "\n".join([line for line in lines if '==' in line and not line.startswith('-e')])
 
+
     def _ask_llm_for_root_cause(self, package, error_message):
         if not self.llm_available: return {}
-        prompt = f"Analyze the Python error that occurred when updating '{package}'. Error: --- {error_message} --- Respond in JSON with 'root_cause': ('self' or 'incompatibility'), and if 'incompatibility', also 'package': 'package_name' and 'suggested_constraint': '<version'."
+        py_version = f"{sys.version_info.major}.{sys.version_info.minor}"
+        
+        with open(self.config["REQUIREMENTS_FILE"], "r") as f:
+            current_requirements = f.read()
+
+        prompt = f"""
+You are an expert Python dependency diagnostician AI.
+Your task is to determine the root cause of a validation failure.
+
+# CONTEXT
+- Python Version: {py_version}
+- Package being updated: '{package}'
+- Current Stable Environment (`requirements.txt`):
+---
+{current_requirements}
+---
+
+# PROBLEM
+The validation test failed with this error:
+---
+{error_message}
+---
+
+# DIAGNOSIS
+Analyze the error. Is the most likely root cause a bug within the new version of '{package}' itself, or is it a runtime incompatibility with another package in the environment?
+- If it's a runtime incompatibility, the error log MUST explicitly mention the other package (e.g., a NumPy ABI error).
+- Respond in a valid, single-line JSON format.
+
+# JSON OUTPUT FORMAT
+- If the problem is with the package itself: `{{"root_cause": "self"}}`
+- If it's an incompatibility: `{{"root_cause": "incompatibility", "package": "name-of-other-package", "suggested_constraint": "<version"}}`
+
+# EXAMPLE FOR NUMPY ABI ERROR
+{{"root_cause": "incompatibility", "package": "numpy", "suggested_constraint": "<2.0"}}
+"""
         try:
             response = self.llm.generate_content(prompt)
             json_text = re.search(r'\{.*\}', response.text, re.DOTALL).group(0)
@@ -407,7 +426,7 @@ Provide a new, corrected list of packages that resolves this conflict. The new l
 
     def _ask_llm_for_version_candidates(self, package, failed_version, error_message):
         if not self.llm_available: return []
-        prompt = f"The python package '{package}' version '{failed_version}' failed validation on Python 3.9. Error: ---{error_message}--- Based on this, give a Python list of the {self.config['MAX_LLM_BACKTRACK_ATTEMPTS']} most recent, previous versions that are most likely to be stable, in descending order. Respond ONLY with the list."
+        prompt = f"The python package '{package}' version '{failed_version}' failed validation on Python 3.11. Error: ---{error_message}--- Based on this, give a Python list of the {self.config['MAX_LLM_BACKTRACK_ATTEMPTS']} most recent, previous versions that are most likely to be stable, in descending order. Respond ONLY with the list."
         try:
             response = self.llm.generate_content(prompt)
             match = re.search(r'(\[.*?\])', response.text, re.DOTALL)
