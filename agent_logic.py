@@ -274,7 +274,8 @@ class DependencyAgent:
         version_candidates = self._ask_llm_for_version_candidates(package, target_version, stderr)
         if version_candidates:
             for candidate in version_candidates:
-                print(f"INFO: Attempting LLM-suggested backtrack for {package} to {candidate}")
+                if parse_version(candidate) < parse_version(current_version):
+                    print(f"INFO: Attempting LLM-suggested backtrack for {package} to {candidate}")
                 success, result_data, _ = self._try_install_and_validate(package, candidate, dynamic_constraints, old_version=current_version)
                 if success:
                     metrics = result_data
