@@ -167,26 +167,22 @@ class DependencyAgent:
             self._run_final_health_check()
 
     def _print_final_summary(self, successful, failed):
-        print("\n" + "#"*70); print("### OVERALL UPDATE RUN SUMMARY ###")
+        print(" OVERALL UPDATE RUN SUMMARY")
         
         if successful:
-            print("\n[SUCCESS] The following packages were successfully updated:")
             print(f"{'Package':<30} | {'Target Version':<20} | {'Reached Version':<20}")
-            print(f"{'-'*30} | {'-'*20} | {'-'*20}")
             for pkg, (target_ver, version) in successful.items():
                 print(f"{pkg:<30} | {target_ver:<20} | {version:<20}")
         
         if failed:
             print("\n[FAILURE] Updates were attempted but FAILED for:")
             print(f"{'Package':<30} | {'Target Version':<20} | {'Reason for Failure'}")
-            print(f"{'-'*30} | {'-'*20} | {'-'*40}")
             for pkg, (target_ver, reason) in failed.items():
                 print(f"{pkg:<30} | {target_ver:<20} | {reason}")
         
-        print("#"*70 + "\n")
 
     def _run_final_health_check(self):
-        print("\n" + "#"*70); print("Combined dependencies validation"); print("#"*70 + "\n")
+        print("Combined dependencies validation")
         venv_dir = Path("./final_venv")
         if venv_dir.exists(): shutil.rmtree(venv_dir)
         venv.create(venv_dir, with_pip=True)
@@ -196,13 +192,13 @@ class DependencyAgent:
             print("CRITICAL ERROR: Final installation of combined dependencies failed!", file=sys.stderr); return
         success, metrics, _ = validate_changes(python_executable, group_title="Final System Health Check")
         if success and metrics and "not available" not in metrics:
-            print("\n" + "="*70); print("=== FINAL METRICS FOR THE FULLY UPDATED ENVIRONMENT ===")
+            print("=== FINAL METRICS FOR THE FULLY UPDATED ENVIRONMENT ===")
             indented_metrics = "\n".join([f"  {line}" for line in metrics.split('\n')])
-            print(indented_metrics); print("="*70)
+            print(indented_metrics)
         elif success:
-            print("\n" + "="*70); print("=== Final validation passed, but metrics were not available in output. ==="); print("="*70)
+            print(" Final validation passed, but metrics were not available in output.")
         else:
-            print("\n" + "!"*70); print("CRITICAL ERROR: Final validation of combined dependencies failed"); print("!"*70)
+            print("CRITICAL ERROR: Final validation of combined dependencies failed")
 
     def get_latest_version(self, package_name):
         try:
