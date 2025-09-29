@@ -21,13 +21,13 @@ class DependencyAgent:
         self.requirements_path = Path(config["REQUIREMENTS_FILE"])
         self.primary_packages = self._load_primary_packages()
         self.llm_available = True
-        self.usage_scores = self._calculate_usage_scores()
+        self.usage_scores = self._calculate_risk_scores()
 
-    def _calculate_usage_scores(self):
-        start_group("Analyzing Codebase for Import Usage")
+    def _calculate_risk_scores(self):
+        start_group("Analyzing Codebase for Update Risk")
         scores = {}
         repo_root = Path('.')
-        print("Scanning all .py files for import statements...")
+        print("Scanning .py files for import statements (usage)...")
         for py_file in repo_root.rglob('*.py'):
             if any(part in str(py_file) for part in ['temp_venv', 'final_venv', 'bootstrap_venv', 'agent_logic.py', 'agent_utils.py', 'dependency_agent.py']):
                 continue
@@ -38,14 +38,13 @@ class DependencyAgent:
                     for node in ast.walk(tree):
                         if isinstance(node, ast.Import):
                             for alias in node.names:
-                                module_name = alias.name.split('.')[0]
+                                module_name = self._get_package_name_from_spec(alias.name)
                                 scores[module_name] = scores.get(module_name, 0) + 1
-                        elif isinstance(node, ast.ImportFrom):
-                            if node.module:
-                                module_name = node.module.split('.')[0]
-                                scores[module_name] = scores.get(module_name, 0) + 1
-            except Exception:
-                continue
+                        elif isinstance(node, ast.ImportFrom) and node.module:
+                            module_name = self._get_package_name_from_spec(node.module)
+                            scores[module_name] = scores.get(module_name, 0) + 1
+            except Exception: continue
+        
         normalized_scores = {name.replace('_', '-'): score for name, score in scores.items()}
         print("Usage scores calculated.")
         end_group()
@@ -85,8 +84,6 @@ class DependencyAgent:
         if metrics:
             with open(self.config["METRICS_OUTPUT_FILE"], "w") as f: f.write(metrics)
 
-    # In agent_logic.py
-
     def run(self):
         if os.path.exists(self.config["METRICS_OUTPUT_FILE"]): os.remove(self.config["METRICS_OUTPUT_FILE"])
         is_pinned, _ = self._get_requirements_state()
@@ -97,12 +94,12 @@ class DependencyAgent:
         dynamic_constraints = []
         final_successful_updates = {}
         final_failed_updates = {}
+        pass_num = 0
         
-        for pass_num in range(1, self.config["MAX_RUN_PASSES"] + 1):
-            print("\n" + "*"*80)
-            print(f"PULSE: Starting Update Pass {pass_num}/{self.config['MAX_RUN_PASSES']}. Current Constraints: {dynamic_constraints}")
-            print("*"*80 + "\n")    
-            start_group(f"UPDATE PASS {pass_num}/{self.config['MAX_RUN_PASSES']} (Constraints: {dynamic_constraints})")  
+        while True:
+            pass_num += 1
+            start_group(f"UPDATE PASS {pass_num} (Constraints: {dynamic_constraints})")
+            
             _, lines = self._get_requirements_state()
             all_reqs = list(set(lines + dynamic_constraints))
             original_requirements = {self._get_package_name_from_spec(line): line for line in all_reqs}
@@ -120,23 +117,17 @@ class DependencyAgent:
                 else: print("\nNo further updates possible. System has converged.")
                 end_group()
                 break
-            
-            packages_to_update.sort(key=lambda p: self.usage_scores.get(p[0], 0), reverse=True)
+
+            packages_to_update.sort(key=lambda p: self._calculate_update_risk(p[0], p[1], p[2]), reverse=True)
             print("\nPrioritized Update Plan for this Pass:")
             total_updates_in_plan = len(packages_to_update)
             for i, (pkg, _, target_ver) in enumerate(packages_to_update):
-                score = self.usage_scores.get(pkg, 0)
-                print(f"  {i+1}/{total_updates_in_plan}: {pkg} (Usage Score: {score}) -> {target_ver}")
+                score = self._calculate_update_risk(pkg, _, target_ver)
+                print(f"  {i+1}/{total_updates_in_plan}: {pkg} (Risk Score: {score:.2f}) -> {target_ver}")
 
             updates_made_this_pass = False
             learned_a_new_constraint = False
             for i, (package, current_ver, target_ver) in enumerate(packages_to_update):
-                
-                # --- Per-module "Pulse" log ---
-                print("\n" + "-"*80)
-                print(f"PULSE: [PASS {pass_num} | ATTEMPT {i+1}/{total_updates_in_plan}] Processing '{package}'")
-                print("-"*80)
-                
                 is_primary = self._get_package_name_from_spec(package) in self.primary_packages
                 success, reason, learned_constraint = self.attempt_update_with_healing(package, current_ver, target_ver, is_primary, dynamic_constraints)
                 
@@ -166,27 +157,35 @@ class DependencyAgent:
         if final_successful_updates:
             self._run_final_health_check()
 
+    def _calculate_update_risk(self, package, current_ver, target_ver):
+        usage = self.usage_scores.get(package, 0)
+        is_primary = 1 if package in self.primary_packages else 0
+        try:
+            old_v, new_v = parse_version(current_ver), parse_version(target_ver)
+            if new_v.major > old_v.major: semver_severity = 3
+            elif new_v.minor > old_v.minor: semver_severity = 2
+            else: semver_severity = 1
+        except: semver_severity = 1
+        return (usage * 0.5) + (is_primary * 0.3) + (semver_severity * 0.2)
+
     def _print_final_summary(self, successful, failed):
         print("\n" + "#"*70); print("### OVERALL UPDATE RUN SUMMARY ###")
-        
         if successful:
             print("\n[SUCCESS] The following packages were successfully updated:")
             print(f"{'Package':<30} | {'Target Version':<20} | {'Reached Version':<20}")
             print(f"{'-'*30} | {'-'*20} | {'-'*20}")
             for pkg, (target_ver, version) in successful.items():
                 print(f"{pkg:<30} | {target_ver:<20} | {version:<20}")
-        
         if failed:
             print("\n[FAILURE] Updates were attempted but FAILED for:")
             print(f"{'Package':<30} | {'Target Version':<20} | {'Reason for Failure'}")
             print(f"{'-'*30} | {'-'*20} | {'-'*40}")
             for pkg, (target_ver, reason) in failed.items():
                 print(f"{pkg:<30} | {target_ver:<20} | {reason}")
-        
         print("#"*70 + "\n")
 
     def _run_final_health_check(self):
-        print("\n" + "#"*70); print("Combined dependencies validation"); print("#"*70 + "\n")
+        print("\n" + "#"*70); print("### FINAL SYSTEM HEALTH CHECK ###"); print("#"*70 + "\n")
         venv_dir = Path("./final_venv")
         if venv_dir.exists(): shutil.rmtree(venv_dir)
         venv.create(venv_dir, with_pip=True)
@@ -202,7 +201,7 @@ class DependencyAgent:
         elif success:
             print("\n" + "="*70); print("=== Final validation passed, but metrics were not available in output. ==="); print("="*70)
         else:
-            print("\n" + "!"*70); print("CRITICAL ERROR: Final validation of combined dependencies failed"); print("!"*70)
+            print("\n" + "!"*70); print("!!! CRITICAL ERROR: Final validation of combined dependencies failed! !!!"); print("!"*70)
 
     def get_latest_version(self, package_name):
         try:
@@ -217,7 +216,6 @@ class DependencyAgent:
         if venv_dir.exists(): shutil.rmtree(venv_dir)
         venv.create(venv_dir, with_pip=True)
         python_executable = str(venv_dir / "bin" / "python")
-        
         with open(self.requirements_path, "r") as f:
              lines = [line.strip() for line in f if line.strip()]
         
@@ -244,7 +242,7 @@ class DependencyAgent:
             return False, "Validation script failed", validation_output
         
         return True, metrics, ""
-    
+
     def attempt_update_with_healing(self, package, current_version, target_version, is_primary, dynamic_constraints):
         package_label = "(Primary)" if is_primary else "(Transient)"
         
@@ -253,7 +251,7 @@ class DependencyAgent:
         if success:
             metrics = result_data
             if metrics and "not available" not in metrics:
-                print(f"\n** SUCCESS: {package} {package_label} updated to {target_version} and passed validation. **")
+                print(f"\n** SUCCESS: {package} {package_label} updated to {target_version} and passed. **")
                 print("\n".join([f"  {line}" for line in metrics.split('\n')]) + "\n")
                 with open(self.config["METRICS_OUTPUT_FILE"], "w") as f: f.write(metrics)
             
@@ -275,77 +273,60 @@ class DependencyAgent:
         if version_candidates:
             for candidate in version_candidates:
                 if parse_version(candidate) < parse_version(current_version):
-                    print(f"INFO: Attempting LLM-suggested backtrack for {package} to {candidate}")
+                    print(f"INFO: Skipping LLM suggestion {candidate} as it's older than current version {current_version}.")
+                    continue
+                print(f"INFO: Attempting LLM-suggested backtrack for {package} to {candidate}")
                 success, result_data, _ = self._try_install_and_validate(package, candidate, dynamic_constraints, old_version=current_version)
                 if success:
-                    metrics = result_data
-                    if metrics and "not available" not in metrics:
-                        print(f"\n** SUCCESS: {package} {package_label} backtracked to {candidate} and passed validation. **")
-                        print("\n".join([f"  {line}" for line in metrics.split('\n')]) + "\n")
-                        with open(self.config["METRICS_OUTPUT_FILE"], "w") as f: f.write(metrics)
-                    
-                    installed_packages, _, _ = run_command([str(Path("./temp_venv/bin/python")), "-m", "pip", "freeze"])
-                    with open(self.requirements_path, "w") as f: f.write(self._prune_pip_freeze(installed_packages))
+                    # Logic for handling success within backtracking
                     return True, candidate, None
 
-        print(f"INFO: LLM suggestions failed. Falling back to Binary Search.")
-        success_package = self._binary_search_backtrack(package, current_version, target_version, dynamic_constraints)
-        
-        if success_package:
-            found_version = success_package["version"]
-            metrics = success_package["metrics"]
-            installed_packages = success_package["installed_packages"]
-
-            if metrics and "not available" not in metrics:
-                print(f"\n** SUCCESS: {package} {package_label} backtracked to {found_version} and passed validation. **")
-                print("\n".join([f"  {line}" for line in metrics.split('\n')]) + "\n")
-                with open(self.config["METRICS_OUTPUT_FILE"], "w") as f: f.write(metrics)
-            
-            with open(self.requirements_path, "w") as f: f.write(self._prune_pip_freeze(installed_packages))
+        print(f"INFO: LLM suggestions failed or were not viable. Falling back to Advanced Binary Search.")
+        found_version = self._advanced_binary_search_backtrack(package, current_version, target_version, dynamic_constraints)
+        if found_version:
             return True, found_version, None
 
         return False, "All backtracking attempts failed.", None
 
-    def _binary_search_backtrack(self, package, last_good_version, failed_version, dynamic_constraints):
-        start_group(f"Binary Search Backtrack for {package}")
-        
+    def _advanced_binary_search_backtrack(self, package, last_good_version, failed_version, dynamic_constraints):
+        start_group(f"Advanced Binary Search Backtrack for {package}")
         versions = self.get_all_versions_between(package, last_good_version, failed_version)
         if not versions:
-            end_group()
-            print(f"Binary Search FAILED: No versions found between {last_good_version} and {failed_version}.")
-            return None
+            end_group(); return None
 
-        low, high = 0, len(versions) - 1
-        best_working_result = None
+        def search_sublist(sub_versions):
+            low, high = 0, len(sub_versions) - 1
+            best_working = None
+            while low <= high:
+                mid_index = (low + high) // 2
+                test_version = sub_versions[mid_index]
+                success, _, _ = self._try_install_and_validate(package, test_version, dynamic_constraints, is_probe=True)
+                if success:
+                    best_working = test_version
+                    low = mid_index + 1
+                else:
+                    high = mid_index - 1
+            return best_working
 
-        while low <= high:
-            mid = (low + high) // 2
-            test_version = versions[mid]
-            
-            success, metrics_or_reason, stderr = self._try_install_and_validate(package, test_version, dynamic_constraints, old_version=last_good_version, is_probe=True)
-            
-            if success:
-                print(f"Binary Search: Version {test_version} PASSED probe.")
+        mid_point = len(versions) // 2
+        newer_half = versions[mid_point:]
+        print(f"Binary Search: Probing newer half of versions first...")
+        best_in_newer = search_sublist(newer_half)
+        
+        if best_in_newer:
+            print(f"Binary Search SUCCESS: Found latest stable version in newer half: {best_in_newer}")
+            end_group(); return best_in_newer
 
-                python_executable_in_venv = str(Path("./temp_venv/bin/python"))
-                installed_packages, _, _ = run_command([python_executable_in_venv, "-m", "pip", "freeze"])
-                
-                best_working_result = {
-                    "version": test_version,
-                    "metrics": metrics_or_reason,
-                    "installed_packages": installed_packages
-                }
-                low = mid + 1 # It worked, so look for an even newer version in the upper half
-            else:
-                reason = metrics_or_reason
-                print(f"Binary Search: Version {test_version} FAILED probe. Reason: {reason}.")
-                high = mid - 1 # It failed, so the problem is in this version or newer   
-        end_group()  
-        if best_working_result:
-            print(f"Binary Search SUCCESS: Found latest stable version to be {best_working_result['version']}")
-            return best_working_result    
-        print(f"Binary Search FAILED: No stable version was found for {package} in the given range.")
-        return None
+        print(f"Binary Search: No stable version in newer half. Probing older half...")
+        older_half = versions[:mid_point]
+        best_in_older = search_sublist(older_half)
+
+        if best_in_older:
+            print(f"Binary Search SUCCESS: Found latest stable version in older half: {best_in_older}")
+            end_group(); return best_in_older
+
+        print(f"Binary Search FAILED: No stable version found for {package}.")
+        end_group(); return None
 
     def get_all_versions_between(self, package_name, start_ver_str, end_ver_str):
         try:
@@ -353,37 +334,10 @@ class DependencyAgent:
             if not (package_info and package_info.packages): return []
             start_v, end_v = parse_version(start_ver_str), parse_version(end_ver_str)
             candidate_versions = [v for p in package_info.packages if p.version and start_v <= (v := parse_version(p.version)) < end_v]
-            return sorted([str(v) for v in set(candidate_versions)], key=parse_version)
+            return sorted([str(v) for v in set(candidate_versions)], key=parse_version, reverse=True)
         except Exception:
             return []
             
-    def resolve_conflict_with_llm(self, error_message, requirements_list):
-        py_version = f"{sys.version_info.major}.{sys.version_info.minor}"
-        original_packages = {self._get_package_name_from_spec(req) for req in requirements_list}
-        prompt = f"""I am an automated script trying to resolve a Python dependency conflict for a project running on Python {py_version}. My attempt to install failed. The error was:
----
-{error_message}
----
-The packages I tried to install are: {requirements_list}.
-Provide a new, corrected list of packages that resolves this conflict. The new list MUST include all original packages. Your response format must be ONLY a Python list of strings. Example: ['numpy<2.0', 'pandas==2.2.0']"""
-        try:
-            print(f"Sending prompt to LLM for conflict resolution (context: Python {py_version})...")
-            response = self.llm.generate_content(prompt)
-            response_text = response.text.strip()
-            match = re.search(r'(\[.*?\])', response_text, re.DOTALL)
-            if not match: return None
-            list_string = match.group(1)
-            solution_list = ast.literal_eval(list_string)
-            if not isinstance(solution_list, list): return None
-            solution_packages = {self._get_package_name_from_spec(req) for req in solution_list}
-            if original_packages != solution_packages: return None
-            return solution_list
-        except ResourceExhausted:
-            self.llm_available = False
-            return None
-        except Exception:
-            return None
-
     def _ask_llm_to_summarize_error(self, error_message):
         if not self.llm_available: return "(LLM unavailable due to quota)"
         prompt = f"The following is a Python pip install error log. Please summarize the root cause of the conflict in a single, concise sentence. Error Log: --- {error_message} ---"
@@ -399,7 +353,18 @@ Provide a new, corrected list of packages that resolves this conflict. The new l
 
     def _ask_llm_for_root_cause(self, package, error_message):
         if not self.llm_available: return {}
-        prompt = f"Analyze the Python error that occurred when updating '{package}'. Error: --- {error_message} --- Respond in JSON with 'root_cause': ('self' or 'incompatibility'), and if 'incompatibility', also 'package': 'package_name' and 'suggested_constraint': '<version'."
+        py_version = f"{sys.version_info.major}.{sys.version_info.minor}"
+        with open(self.config["REQUIREMENTS_FILE"], "r") as f:
+            current_requirements = f.read()
+        prompt = f"""You are an expert Python dependency diagnostician AI. Analyze the error that occurred when updating '{package}' in a project with these requirements:
+---
+{current_requirements}
+---
+The error on Python {py_version} was:
+---
+{error_message}
+---
+Respond in JSON. Is the root_cause 'self' or 'incompatibility'? If incompatibility, name the 'package' and 'suggested_constraint'. Example: {{"root_cause": "incompatibility", "package": "numpy", "suggested_constraint": "<2.0"}}"""
         try:
             response = self.llm.generate_content(prompt)
             json_text = re.search(r'\{.*\}', response.text, re.DOTALL).group(0)
@@ -408,10 +373,13 @@ Provide a new, corrected list of packages that resolves this conflict. The new l
 
     def _ask_llm_for_version_candidates(self, package, failed_version, error_message):
         if not self.llm_available: return []
-        prompt = f"The python package '{package}' version '{failed_version}' failed validation on Python 3.9. Error: ---{error_message}--- Based on this, give a Python list of the {self.config['MAX_LLM_BACKTRACK_ATTEMPTS']} most recent, previous versions that are most likely to be stable, in descending order. Respond ONLY with the list."
+        prompt = f"""The python package '{package}' version '{failed_version}' failed validation on Python 3.9. Error: ---{error_message}--- Based on this, give a Python list of the {self.config['MAX_LLM_BACKTRACK_ATTEMPTS']} most recent, previous versions that are most likely to be stable, in descending order. Respond ONLY with the list."""
         try:
             response = self.llm.generate_content(prompt)
             match = re.search(r'(\[.*?\])', response.text, re.DOTALL)
             if not match: return []
             return ast.literal_eval(match.group(1))
+        except ResourceExhausted:
+            self.llm_available = False
+            return []
         except Exception: return []
