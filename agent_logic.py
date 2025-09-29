@@ -294,7 +294,7 @@ class DependencyAgent:
                     return True, candidate, None
 
         print(f"INFO: LLM suggestions failed. Falling back to Advanced Binary Search.")
-        found_version = self._advanced_binary_search_backtrack(package, current_version, target_version, dynamic_constraints, changed_packages_this_pass)
+        found_version = self.binary_search_backtrack(package, current_version, target_version, dynamic_constraints, changed_packages_this_pass)
         if found_version:
             if found_version == current_version:
                 print(f"INFO: Backtracking for {package} only found the existing version ({current_version}) to be stable.")
@@ -379,7 +379,8 @@ class DependencyAgent:
         if not self.llm_available: return {}
         prompt = f"..."
         try:
-            # ...
+            response = self.llm.generate_content(prompt)
+            json_text = response.text.strip()
             return json.loads(json_text)
         except Exception: return {}
 
