@@ -318,9 +318,10 @@ class DependencyAgent:
         start_group(f"Binary Search Backtrack for {package}")
         
         versions = self.get_all_versions_between(package, last_good_version, failed_version)
-        
         if not versions:
-            end_group(); return None
+            end_group()
+            print(f"Binary Search FAILED: No versions found between {last_good_version} and {failed_version}.")
+            return None
 
         low, high = 0, len(versions) - 1
         best_working_result = None
@@ -329,10 +330,11 @@ class DependencyAgent:
             mid = (low + high) // 2
             test_version = versions[mid]
             
-            success, metrics_or_reason, _ = self._try_install_and_validate(package, test_version, dynamic_constraints, old_version=last_good_version, is_probe=True, changed_packages=changed_packages)
+            success, metrics_or_reason, stderr = self._try_install_and_validate(package, test_version, dynamic_constraints, old_version=last_good_version, is_probe=True, changed_packages=changed_packages)
             
             if success:
                 print(f"Binary Search: Version {test_version} PASSED probe.")
+
                 python_executable_in_venv = str(Path("./temp_venv/bin/python"))
                 installed_packages, _, _ = run_command([python_executable_in_venv, "-m", "pip", "freeze"])
                 
@@ -341,15 +343,16 @@ class DependencyAgent:
                     "metrics": metrics_or_reason,
                     "installed_packages": installed_packages
                 }
-                low = mid + 1
+                low = mid + 1 # It worked, so look for an even newer version in the upper half
             else:
-                high = mid - 1
-        
-        end_group()
+                reason = metrics_or_reason
+                print(f"Binary Search: Version {test_version} FAILED probe. Reason: {reason}.")
+                high = mid - 1 # It failed, so the problem is in this version or newer   
+        end_group()  
         if best_working_result:
             print(f"Binary Search SUCCESS: Found latest stable version to be {best_working_result['version']}")
-            return best_working_result
-        print(f"Binary Search FAILED: No stable version was found for {package}.")
+            return best_working_result    
+        print(f"Binary Search FAILED: No stable version was found for {package} in the given range.")
         return None
 
     def get_all_versions_between(self, package_name, start_ver_str, end_ver_str):
