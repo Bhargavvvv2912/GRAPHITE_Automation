@@ -231,17 +231,24 @@ class DependencyAgent:
             return max(stable_versions, key=parse_version) if stable_versions else max([p.version for p in package_info.packages if p.version], key=parse_version)
         except Exception: return None
 
-    def _try_install_and_validate(self, package_to_update, new_version, dynamic_constraints, old_version='N/A', is_probe=False):
+    # In agent_logic.py, replace your existing _try_install_and_validate() function with this.
+
+    def _try_install_and_validate(self, package_to_update, new_version, dynamic_constraints, old_version='N/A', is_probe=False, changed_packages=None):
+        """
+        MODIFIED: Correctly accepts the 'changed_packages' parameter for adaptive validation.
+        """
         venv_dir = Path("./temp_venv")
         if venv_dir.exists(): shutil.rmtree(venv_dir)
         venv.create(venv_dir, with_pip=True)
         python_executable = str(venv_dir / "bin" / "python")
+        
         with open(self.requirements_path, "r") as f:
              lines = [line.strip() for line in f if line.strip()]
         
         requirements_list = [f"{package_to_update}=={new_version}" if self._get_package_name_from_spec(l) == package_to_update else l for l in lines]
         requirements_list.extend(dynamic_constraints)
         
+        # Don't create a group for quick probes
         if not is_probe:
             start_group(f"Attempting to install {package_to_update}=={new_version}")
             print(f"\nChange analysis: Updating '{package_to_update}' from {old_version} -> {new_version}")
@@ -256,8 +263,12 @@ class DependencyAgent:
             reason = f"Installation conflict. Summary: {llm_summary}"
             return False, reason, stderr_install
         
-        group_title = f"Validation for {package_to_update}=={new_version}"
-        success, metrics, validation_output = validate_changes(python_executable, group_title=group_title)
+        # <<< THIS IS THE NEW ADAPTIVE VALIDATION LOGIC >>>
+        if changed_packages is not None and not changed_packages:
+            print("\n--> STEP 2: SKIPPING validation because no preceding packages have effectively changed in this pass.")
+            return True, "Validation skipped (no changes)", ""
+
+        success, metrics, validation_output = validate_changes(python_executable, group_title=f"Validation for {package_to_update}=={new_version}")
         if not success:
             return False, "Validation script failed", validation_output
         
@@ -329,46 +340,80 @@ class DependencyAgent:
 
         return False, "All backtracking attempts failed.", None
 
-    def _advanced_binary_search_backtrack(self, package, last_good_version, failed_version, dynamic_constraints):
-        start_group(f"Advanced Binary Search Backtrack for {package}")
-        versions = self.get_all_versions_between(package, last_good_version, failed_version)
-        versions.insert(0, last_good_version) 
-        if not versions:
-            end_group(); return None
+    # In agent_logic.py, replace your existing binary search function with this one.
 
+    def _advanced_binary_search_backtrack(self, package, last_good_version, failed_version, dynamic_constraints, changed_packages):
+        """
+        The definitive, advanced binary search that correctly probes the newer half first,
+        passes the changed_packages state correctly, and captures the final state to
+        avoid redundant validations.
+        """
+        start_group(f"Advanced Binary Search Backtrack for {package}")
+        
+        versions = self.get_all_versions_between(package, last_good_version, failed_version)
+        versions.insert(0, last_good_version) # Add last good version as a valid candidate
+        if not versions:
+            end_group()
+            print(f"Binary Search FAILED: No versions found between {last_good_version} and {failed_version}.")
+            return None
+
+        # This is the inner helper that performs the actual search on a given list
         def search_sublist(sub_versions):
             low, high = 0, len(sub_versions) - 1
-            best_working = None
+            best_working_result = None
             while low <= high:
                 mid_index = (low + high) // 2
                 test_version = sub_versions[mid_index]
-                success, _, _ = self._try_install_and_validate(package, test_version, dynamic_constraints, is_probe=True)
+                
+                # Correctly pass the changed_packages set to the probe
+                success, metrics_or_reason, _ = self._try_install_and_validate(
+                    package, test_version, dynamic_constraints, 
+                    old_version=last_good_version, is_probe=True, changed_packages=changed_packages
+                )
+                
                 if success:
-                    best_working = test_version
-                    low = mid_index + 1
+                    print(f"Binary Search: Version {test_version} PASSED probe.")
+                    # Capture the complete state of this successful run
+                    python_executable_in_venv = str(Path("./temp_venv/bin/python"))
+                    installed_packages, _, _ = run_command([python_executable_in_venv, "-m", "pip", "freeze"])
+                    
+                    best_working_result = {
+                        "version": test_version,
+                        "metrics": metrics_or_reason,
+                        "installed_packages": installed_packages
+                    }
+                    low = mid_index + 1 # It worked, so look for an even newer version
                 else:
-                    high = mid_index - 1
-            return best_working
+                    print(f"Binary Search: Version {test_version} FAILED probe. Reason: {metrics_or_reason}.")
+                    high = mid_index - 1 # The problem is in this version or newer
+            
+            return best_working_result
 
+        # Your brilliant two-stage search logic
         mid_point = len(versions) // 2
-        newer_half = versions[mid_point:]
-        print(f"Binary Search: Probing newer half of versions first...")
+        # Ensure we search from most recent to oldest in each half
+        newer_half = sorted(versions[mid_point:], key=parse_version, reverse=True)
+        older_half = sorted(versions[:mid_point], key=parse_version, reverse=True)
+
+        print(f"Binary Search: Probing {len(newer_half)} versions in the newer half first...")
         best_in_newer = search_sublist(newer_half)
         
         if best_in_newer:
-            print(f"Binary Search SUCCESS: Found latest stable version in newer half: {best_in_newer}")
-            end_group(); return best_in_newer
+            print(f"Binary Search SUCCESS: Found latest stable version in newer half: {best_in_newer['version']}")
+            end_group()
+            return best_in_newer
 
-        print(f"Binary Search: No stable version in newer half. Probing older half...")
-        older_half = versions[:mid_point]
+        print(f"Binary Search: No stable version in newer half. Probing {len(older_half)} versions in the older half...")
         best_in_older = search_sublist(older_half)
 
         if best_in_older:
-            print(f"Binary Search SUCCESS: Found latest stable version in older half: {best_in_older}")
-            end_group(); return best_in_older
+            print(f"Binary Search SUCCESS: Found latest stable version in older half: {best_in_older['version']}")
+            end_group()
+            return best_in_older
 
         print(f"Binary Search FAILED: No stable version found for {package}.")
-        end_group(); return None
+        end_group()
+        return None
 
     def get_all_versions_between(self, package_name, start_ver_str, end_ver_str):
         try:
