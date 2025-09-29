@@ -84,8 +84,12 @@ class DependencyAgent:
         if metrics:
             with open(self.config["METRICS_OUTPUT_FILE"], "w") as f: f.write(metrics)
 
+    # In agent_logic.py, replace the entire run() method with this one.
+
     def run(self):
-        if os.path.exists(self.config["METRICS_OUTPUT_FILE"]): os.remove(self.config["METRICS_OUTPUT_FILE"])
+        if os.path.exists(self.config["METRICS_OUTPUT_FILE"]):
+            os.remove(self.config["METRICS_OUTPUT_FILE"])
+        
         is_pinned, _ = self._get_requirements_state()
         if not is_pinned:
             self._bootstrap_unpinned_requirements()
@@ -96,9 +100,10 @@ class DependencyAgent:
         final_failed_updates = {}
         pass_num = 0
         
-        while True:
+        # <<< THIS IS THE CORRECTED MASTER LOOP >>>
+        while pass_num < self.config["MAX_RUN_PASSES"]:
             pass_num += 1
-            start_group(f"UPDATE PASS {pass_num} (Constraints: {dynamic_constraints})")
+            start_group(f"UPDATE PASS {pass_num}/{self.config['MAX_RUN_PASSES']} (Constraints: {dynamic_constraints})")
             
             _, lines = self._get_requirements_state()
             all_reqs = list(set(lines + dynamic_constraints))
@@ -113,17 +118,19 @@ class DependencyAgent:
                     packages_to_update.append((package, current_version, latest_version))
             
             if not packages_to_update:
-                if pass_num == 1: print("\nAll dependencies are up-to-date.")
-                else: print("\nNo further updates possible. System has converged.")
+                if pass_num == 1:
+                    print("\nAll dependencies are up-to-date.")
+                else:
+                    print("\nNo further updates possible in this pass. System has converged.")
                 end_group()
-                break
-
-            packages_to_update.sort(key=lambda p: self._calculate_update_risk(p[0], p[1], p[2]), reverse=True)
+                break # Exit the while loop
+            
+            packages_to_update.sort(key=lambda p: self.usage_scores.get(p[0], 0), reverse=True)
             print("\nPrioritized Update Plan for this Pass:")
             total_updates_in_plan = len(packages_to_update)
             for i, (pkg, _, target_ver) in enumerate(packages_to_update):
-                score = self._calculate_update_risk(pkg, _, target_ver)
-                print(f"  {i+1}/{total_updates_in_plan}: {pkg} (Risk Score: {score:.2f}) -> {target_ver}")
+                score = self.usage_scores.get(pkg, 0)
+                print(f"  {i+1}/{total_updates_in_plan}: {pkg} (Usage Score: {score}) -> {target_ver}")
 
             updates_made_this_pass = False
             learned_a_new_constraint = False
