@@ -84,8 +84,14 @@ class DependencyAgent:
         if metrics:
             with open(self.config["METRICS_OUTPUT_FILE"], "w") as f: f.write(metrics)
 
+    # In agent_logic.py, replace your entire existing run() method with this.
+
+    # In agent_logic.py
+
     def run(self):
-        if os.path.exists(self.config["METRICS_OUTPUT_FILE"]): os.remove(self.config["METRICS_OUTPUT_FILE"])
+        if os.path.exists(self.config["METRICS_OUTPUT_FILE"]):
+            os.remove(self.config["METRICS_OUTPUT_FILE"])
+        
         is_pinned, _ = self._get_requirements_state()
         if not is_pinned:
             self._bootstrap_unpinned_requirements()
@@ -96,10 +102,12 @@ class DependencyAgent:
         final_failed_updates = {}
         pass_num = 0
         
+        # This is the true while loop with the safety break
         while pass_num < self.config["MAX_RUN_PASSES"]:
             pass_num += 1
             start_group(f"UPDATE PASS {pass_num}/{self.config['MAX_RUN_PASSES']} (Constraints: {dynamic_constraints})")
             
+            # This is your "dlist", reset for each new pass
             changed_packages_this_pass = set()
             
             _, lines = self._get_requirements_state()
@@ -115,12 +123,15 @@ class DependencyAgent:
                     packages_to_update.append((package, current_version, latest_version))
             
             if not packages_to_update:
-                if pass_num == 1: print("\nAll dependencies are up-to-date.")
-                else: print("\nNo further updates possible. System has converged.")
+                if pass_num == 1:
+                    print("\nAll dependencies are up-to-date.")
+                else:
+                    print("\nNo further updates possible in this pass. System has converged.")
                 end_group()
-                break
+                break # Exit the while loop
             
             packages_to_update.sort(key=lambda p: self._calculate_update_risk(p[0], p[1], p[2]), reverse=True)
+            
             print("\nPrioritized Update Plan for this Pass:")
             total_updates_in_plan = len(packages_to_update)
             for i, (pkg, _, target_ver) in enumerate(packages_to_update):
@@ -129,13 +140,22 @@ class DependencyAgent:
 
             learned_a_new_constraint = False
             for i, (package, current_ver, target_ver) in enumerate(packages_to_update):
-                print(f"\n" + "-"*80); print(f"PULSE: [PASS {pass_num} | ATTEMPT {i+1}/{total_updates_in_plan}] Processing '{package}'"); print("-"*80)
+                print("\n" + "-"*80)
+                print(f"PULSE: [PASS {pass_num} | ATTEMPT {i+1}/{total_updates_in_plan}] Processing '{package}'")
+                print("-"*80)
+
                 is_primary = self._get_package_name_from_spec(package) in self.primary_packages
-                success, reason, learned_constraint = self.attempt_update_with_healing(package, current_ver, target_ver, is_primary, dynamic_constraints, changed_packages_this_pass)
+                
+                success, reason, learned_constraint = self.attempt_update_with_healing(
+                    package, current_ver, target_ver, is_primary, dynamic_constraints, changed_packages_this_pass
+                )
                 
                 if success:
                     final_successful_updates[package] = (target_ver, reason)
-                    if package in final_failed_updates: del final_failed_updates[package]
+                    if package in final_failed_updates:
+                        del final_failed_updates[package]
+                    
+                    # Add to dlist ONLY if the version number actually changed.
                     if current_ver != reason:
                         changed_packages_this_pass.add(package)
                 else:
@@ -151,11 +171,13 @@ class DependencyAgent:
                 print("ACTION: Restarting update pass to apply newly learned global constraint.")
                 continue
             
+            # <<< THIS IS YOUR CRITICAL "dlist is empty" BREAK CONDITION >>>
             if not changed_packages_this_pass:
                 print("\nNo effective version changes were made in this pass. System is stable.")
                 break
         
         self._print_final_summary(final_successful_updates, final_failed_updates)
+
         if final_successful_updates:
             self._run_final_health_check()
 
@@ -211,11 +233,14 @@ class DependencyAgent:
             return max(stable_versions, key=parse_version) if stable_versions else max([p.version for p in package_info.packages if p.version], key=parse_version)
         except Exception: return None
 
+    # In agent_logic.py, replace your existing _try_install_and_validate() method with this.
+
     def _try_install_and_validate(self, package_to_update, new_version, dynamic_constraints, old_version='N/A', is_probe=False, changed_packages=None):
         venv_dir = Path("./temp_venv")
         if venv_dir.exists(): shutil.rmtree(venv_dir)
         venv.create(venv_dir, with_pip=True)
         python_executable = str(venv_dir / "bin" / "python")
+        
         with open(self.requirements_path, "r") as f:
              lines = [line.strip() for line in f if line.strip()]
         
@@ -228,13 +253,15 @@ class DependencyAgent:
         
         _, stderr_install, returncode = run_command([python_executable, "-m", "pip", "install"] + requirements_list)
         
-        if not is_probe: end_group()
+        if not is_probe:
+            end_group()
         
         if returncode != 0:
             llm_summary = self._ask_llm_to_summarize_error(stderr_install)
             reason = f"Installation conflict. Summary: {llm_summary}"
             return False, reason, stderr_install
         
+        # Correctly implement the adaptive validation skip
         if is_probe and (changed_packages is not None and not changed_packages):
             print("\n--> STEP 2: SKIPPING validation for probe as no preceding packages have effectively changed.")
             return True, "Validation skipped (probe on unchanged state)", ""
@@ -243,6 +270,7 @@ class DependencyAgent:
         success, metrics, validation_output = validate_changes(python_executable, group_title=group_title)
         if not success:
             return False, "Validation script failed", validation_output
+        
         return True, metrics, ""
 
     def attempt_update_with_healing(self, package, current_version, target_version, is_primary, dynamic_constraints, changed_packages_this_pass):
@@ -286,32 +314,52 @@ class DependencyAgent:
 
         return False, "All backtracking attempts failed.", None
 
+    # In agent_logic.py, replace your existing binary search function with this one.
+
     def _binary_search_backtrack(self, package, last_good_version, failed_version, dynamic_constraints, changed_packages):
         start_group(f"Binary Search Backtrack for {package}")
+        
         versions = self.get_all_versions_between(package, last_good_version, failed_version)
+        # Add the last known good version back into the pool of candidates. This is a critical fix.
+        if last_good_version not in versions:
+            versions.insert(0, last_good_version)
+        
         if not versions:
             end_group(); return None
 
         low, high = 0, len(versions) - 1
         best_working_result = None
+
         while low <= high:
             mid = (low + high) // 2
             test_version = versions[mid]
-            success, metrics_or_reason, _ = self._try_install_and_validate(package, test_version, dynamic_constraints, old_version=last_good_version, is_probe=True, changed_packages=changed_packages)
+            
+            success, metrics_or_reason, _ = self._try_install_and_validate(
+                package, test_version, dynamic_constraints, 
+                old_version=last_good_version, is_probe=True, changed_packages=changed_packages
+            )
+            
             if success:
                 print(f"Binary Search: Version {test_version} PASSED probe.")
                 python_executable_in_venv = str(Path("./temp_venv/bin/python"))
                 installed_packages, _, _ = run_command([python_executable_in_venv, "-m", "pip", "freeze"])
-                best_working_result = {"version": test_version, "metrics": metrics_or_reason, "installed_packages": installed_packages}
+                
+                best_working_result = {
+                    "version": test_version,
+                    "metrics": metrics_or_reason,
+                    "installed_packages": installed_packages
+                }
                 low = mid + 1
             else:
                 print(f"Binary Search: Version {test_version} FAILED probe. Reason: {metrics_or_reason}.")
                 high = mid - 1
         
         end_group()
+        
         if best_working_result:
             print(f"Binary Search SUCCESS: Found latest stable version to be {best_working_result['version']}")
             return best_working_result
+        
         print(f"Binary Search FAILED: No stable version was found for {package}.")
         return None
 
@@ -358,6 +406,7 @@ Respond in JSON. Is the root_cause 'self' or 'incompatibility'? If incompatibili
             json_text = re.search(r'\{.*\}', response.text, re.DOTALL).group(0)
             return json.loads(json_text)
         except Exception: return {}
+
 
     def _ask_llm_for_version_candidates(self, package, failed_version):
         if not self.llm_available: return []
