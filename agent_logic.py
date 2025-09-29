@@ -342,7 +342,7 @@ class DependencyAgent:
 
     # In agent_logic.py, replace your existing binary search function with this one.
 
-    def _advanced_binary_search_backtrack(self, package, last_good_version, failed_version, dynamic_constraints, changed_packages):
+    def _binary_search_backtrack(self, package, last_good_version, failed_version, dynamic_constraints, changed_packages):
         """
         The definitive, advanced binary search that correctly probes the newer half first,
         passes the changed_packages state correctly, and captures the final state to
