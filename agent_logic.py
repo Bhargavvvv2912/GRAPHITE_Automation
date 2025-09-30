@@ -373,7 +373,7 @@ Respond in JSON. Is the root_cause 'self' or 'incompatibility'? If incompatibili
 
     def _ask_llm_for_version_candidates(self, package, failed_version):
         if not self.llm_available: return []
-        prompt = f"Give a Python list of the {self.config['MAX_LLM_BACKTRACK_ATTEMPTS']} most recent, previous release versions of the python package '{package}', starting from the version just before '{failed_version}'. The list must be in descending order. Respond ONLY with the list."
+        prompt = f"Give a Python list of the {self.config['MAX_LLM_BACKTRACK_ATTEMPTS']} most recent, previous release versions of the python package '{package}', starting from the version just before '{failed_version}'. The list must be in descending order. Respond ONLY with the list. An example could be only '[2.2.3, 2.2.2, 2.1.0]'"
         try:
             response = self.llm.generate_content(prompt)
             match = re.search(r'(\[.*?\])', response.text, re.DOTALL)
