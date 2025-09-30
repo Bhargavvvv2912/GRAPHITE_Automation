@@ -344,8 +344,8 @@ class DependencyAgent:
             package_info = self.pypi.get_project_page(package_name)
             if not (package_info and package_info.packages): return []
             start_v, end_v = parse_version(start_ver_str), parse_version(end_ver_str)
-            candidate_versions = [v for p in package_info.packages if p.version and start_v <= (v := parse_version(p.version)) <= end_v]
-            return sorted([str(v) for v in set(candidate_versions)], key=parse_version, reverse=True)
+            candidate_versions = [v for p in package_info.packages if p.version and start_v <= (v := parse_version(p.version)) < end_v]
+            return sorted([str(v) for v in set(candidate_versions)], key=parse_version)
         except Exception: return []
 
     def _ask_llm_to_summarize_error(self, error_message):
