@@ -247,7 +247,7 @@ class DependencyAgent:
 
     def attempt_update_with_healing(self, package, current_version, target_version, is_primary, dynamic_constraints, changed_packages_this_pass):
         package_label = "(Primary)" if is_primary else "(Transient)"
-        success, result_data, stderr = self._try_install_and_validate(package, target_version, dynamic_constraints, old_version=current_version, changed_packages=changed_packages_this_pass)
+        success, result_data, stderr = self._try_install_and_validate(package, target_version, dynamic_constraints, old_version=current_version, is_probe=False, changed_packages=changed_packages_this_pass)
         
         if success:
             self._handle_success(package, target_version, result_data, package_label)
@@ -267,7 +267,7 @@ class DependencyAgent:
             for candidate in version_candidates:
                 if parse_version(candidate) < parse_version(current_version): continue
                 print(f"INFO: Attempting LLM-suggested backtrack for {package} to {candidate}")
-                success, result_data, _ = self._try_install_and_validate(package, candidate, dynamic_constraints, old_version=current_version, changed_packages=changed_packages_this_pass)
+                success, result_data, _ = self._try_install_and_validate(package, candidate, dynamic_constraints, old_version=current_version, is_probe=False, changed_packages=changed_packages_this_pass)
                 if success:
                     self._handle_success(package, candidate, result_data, package_label)
                     return True, candidate, None
