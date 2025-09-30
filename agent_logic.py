@@ -289,7 +289,9 @@ class DependencyAgent:
         else:
             print(f"\n** SUCCESS: {package} {package_label} finalized at {new_version} and passed (metrics unavailable). **\n")
         
-        installed_packages, _, _ = run_command([str(Path("./temp_venv/bin/python")), "-m", "pip", "freeze"])
+        if not installed_packages:
+            python_executable_in_venv = str(Path("./temp_venv/bin/python"))
+            installed_packages, _, _ = run_command([python_executable_in_venv, "-m", "pip", "freeze"])
         with open(self.requirements_path, "w") as f: f.write(self._prune_pip_freeze(installed_packages))
 
     def _binary_search_backtrack(self, package, last_good_version, failed_version, dynamic_constraints, changed_packages):
