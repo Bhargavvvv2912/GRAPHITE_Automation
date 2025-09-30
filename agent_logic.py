@@ -281,7 +281,7 @@ class DependencyAgent:
 
         return False, "All backtracking attempts failed.", None
     
-    def _handle_success(self, package, new_version, metrics, package_label):
+    def _handle_success(self, package, new_version, metrics, package_label, installed_packages=None):
         if metrics and "not available" not in metrics:
             print(f"\n** SUCCESS: {package} {package_label} finalized at {new_version} and passed validation. **")
             print("\n".join([f"  {line}" for line in metrics.split('\n')]) + "\n")
