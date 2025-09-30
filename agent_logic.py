@@ -234,17 +234,20 @@ class DependencyAgent:
             reason = f"Installation conflict. Summary: {llm_summary}"
             return False, reason, stderr_install
         
-        success, metrics, stderr_validate = validate_changes(python_executable, group_title=f"Validation after installing {package_to_update}=={new_version}")      
+        is_upgrade = new_version != old_version
+        if not is_upgrade and not changed_packages:
+             print("\n--> STEP 2: SKIPPING validation because no effective change has occurred.")
+             return True, "Validation skipped (no change)", ""
+
+        group_title = f"Validation for {package_to_update}=={new_version}"
+        success, metrics, validation_output = validate_changes(python_executable, group_title=group_title)
         if not success:
-            reason = "Validation step failed after installation."
-            return False, reason, stderr_validate
-        return True, metrics if metrics else "Metrics not available for this run.", stderr_validate
-    
+            return False, "Validation script failed", validation_output
+        return True, metrics, ""
 
     def attempt_update_with_healing(self, package, current_version, target_version, is_primary, dynamic_constraints, changed_packages_this_pass):
         package_label = "(Primary)" if is_primary else "(Transient)"
-        is_probe = False
-        success, result_data, stderr = self._try_install_and_validate(package, target_version, dynamic_constraints, current_version, is_probe, changed_packages_this_pass)
+        success, result_data, stderr = self._try_install_and_validate(package, target_version, dynamic_constraints, old_version=current_version, changed_packages=changed_packages_this_pass)
         
         if success:
             self._handle_success(package, target_version, result_data, package_label)
@@ -264,7 +267,7 @@ class DependencyAgent:
             for candidate in version_candidates:
                 if parse_version(candidate) < parse_version(current_version): continue
                 print(f"INFO: Attempting LLM-suggested backtrack for {package} to {candidate}")
-                success, result_data, _ = self._try_install_and_validate(package, candidate, dynamic_constraints, current_version, is_probe, changed_packages_this_pass)
+                success, result_data, _ = self._try_install_and_validate(package, candidate, dynamic_constraints, old_version=current_version, changed_packages=changed_packages_this_pass)
                 if success:
                     self._handle_success(package, candidate, result_data, package_label)
                     return True, candidate, None
@@ -274,16 +277,7 @@ class DependencyAgent:
         if success_package:
             found_version = success_package["version"]
             self._handle_success(package, found_version, success_package["metrics"], package_label, installed_packages=success_package["installed_packages"])
-            is_upgrade = found_version != current_version
-            if not is_upgrade and not changed_packages_this_pass:
-                print("\n--> STEP 2: SKIPPING validation because no effective change has occurred.")
-                return True, "Validation skipped (no change)", ""
-            python_executable = str(Path("./temp_venv/bin/python"))
-            group_title = f"Validation after binary search for {package}=={found_version}"
-            success, metrics, validation_output = validate_changes(python_executable, group_title=group_title)
-            if not success:
-                return False, "Validation script failed", validation_output
-            return True, metrics, ""
+            return True, found_version, None
 
         return False, "All backtracking attempts failed.", None
     
