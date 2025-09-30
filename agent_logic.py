@@ -263,7 +263,8 @@ class DependencyAgent:
             for candidate in version_candidates:
                 if parse_version(candidate) < parse_version(current_version): continue
                 print(f"INFO: Attempting LLM-suggested backtrack for {package} to {candidate}")
-                success, result_data, _ = self._try_install_and_validate(package, candidate, dynamic_constraints, old_version=current_version, changed_packages=changed_packages_this_pass)
+                is_probe = False
+                success, result_data, _ = self._try_install_and_validate(package, candidate, dynamic_constraints, current_version, is_probe, changed_packages_this_pass)
                 if success:
                     self._handle_success(package, candidate, result_data, package_label)
                     return True, candidate, None
