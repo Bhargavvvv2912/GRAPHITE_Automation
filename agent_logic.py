@@ -151,6 +151,7 @@ class DependencyAgent:
             print(f"  LLM Heal Attempt {attempt + 1}/{self.config['MAX_LLM_BACKTRACK_ATTEMPTS']}...")
             
             # **FIXED HERE:** Construct the prompt safely using concatenation to avoid f-string parsing issues.
+            failing_packages_str = "\n".join(failing_packages)
             prompt_base = f"""You are an expert Python dependency debugging AI. A project's validation fails with the following packages installed. Your task is to suggest a targeted downgrade of one or more packages to fix the runtime error. Your response MUST be a single, valid JSON object and nothing else.
 
             Original unpinned requirements:
@@ -159,7 +160,7 @@ class DependencyAgent:
             ---
             Full list of failing installed packages:
             ---
-            {"\n".join(failing_packages)}
+            {failing_packages_str}
             ---
             Validation error log:
             ---
