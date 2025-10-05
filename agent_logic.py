@@ -144,12 +144,14 @@ class DependencyAgent:
         except FileNotFoundError:
              print("Could not read original requirements file for LLM context.")
 
+        # Define the example separately to ensure it is treated as a simple string.
+        example_json = '{"changes": [{"package": "numpy", "version": "1.26.4"}]}'
+
         for attempt in range(self.config["MAX_LLM_BACKTRACK_ATTEMPTS"]):
             print(f"  LLM Heal Attempt {attempt + 1}/{self.config['MAX_LLM_BACKTRACK_ATTEMPTS']}...")
             
-            # **FIXED HERE:** JSON example is now a separate variable to avoid f-string syntax errors.
-            example_json = '{"changes": [{"package": "numpy", "version": "1.26.4"}]}'
-            prompt = f"""You are an expert Python dependency debugging AI. A project's validation fails with the following packages installed. Your task is to suggest a targeted downgrade of one or more packages to fix the runtime error. Your response MUST be a single, valid JSON object and nothing else.
+            # **FIXED HERE:** Construct the prompt safely using concatenation to avoid f-string parsing issues.
+            prompt_base = f"""You are an expert Python dependency debugging AI. A project's validation fails with the following packages installed. Your task is to suggest a targeted downgrade of one or more packages to fix the runtime error. Your response MUST be a single, valid JSON object and nothing else.
 
             Original unpinned requirements:
             ---
@@ -164,8 +166,8 @@ class DependencyAgent:
             {error_log}
             ---
             Propose a change. Respond ONLY with a JSON object like this example:
-            {example_json}
             """
+            prompt = prompt_base + example_json
 
             try:
                 response = self.llm.generate_content(prompt)
