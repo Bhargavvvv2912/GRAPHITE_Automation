@@ -27,6 +27,7 @@ class DependencyAgent:
     def _calculate_risk_scores(self, custom_package_list=None):
         if custom_package_list:
             start_group("Calculating Risk Scores for Custom Package List")
+            # Create scores based on pre-calculated usage, default to 1 if not found
             scores = {self._get_package_name_from_spec(pkg): self.usage_scores.get(self._get_package_name_from_spec(pkg), 1) for pkg in custom_package_list}
             print("Dynamic risk scores calculated for healing.")
             end_group()
@@ -117,14 +118,12 @@ class DependencyAgent:
         print("\nCRITICAL: Initial baseline failed validation. Initiating Bootstrap Healing Protocol.", file=sys.stderr)
         start_group("View Initial Baseline Failure Log"); print(error_log); end_group()
         
-        # --- Start Bootstrap Healing Protocol ---
-        initial_failing_packages_list, _, _ = run_command([str(venv_dir / "bin" / "python"), "-m", "pip", "freeze"])
+        python_executable = str(venv_dir / "bin" / "python")
+        initial_failing_packages_list, _, _ = run_command([python_executable, "-m", "pip", "freeze"])
         initial_failing_packages = self._prune_pip_freeze(initial_failing_packages_list).split('\n')
 
-        # --- Attempt 1: LLM-Powered Diagnosis ---
         healed_packages = self._attempt_llm_bootstrap_heal(initial_failing_packages, error_log)
         
-        # --- Attempt 2: Deterministic Fallback ---
         if not healed_packages:
             print("\nINFO: LLM healing failed. Falling back to Deterministic Downgrade Protocol.")
             healed_packages = self._attempt_deterministic_bootstrap_heal(initial_failing_packages)
@@ -140,12 +139,18 @@ class DependencyAgent:
     def _attempt_llm_bootstrap_heal(self, failing_packages, error_log):
         print("\nINFO: Attempting LLM-powered diagnosis for bootstrap failure.")
         original_reqs = ""
-        with open(self.requirements_path, 'r') as f: original_reqs = f.read()
+        try:
+            with open(self.requirements_path, 'r') as f: original_reqs = f.read()
+        except FileNotFoundError:
+             print("Could not read original requirements file for LLM context.")
 
         for attempt in range(self.config["MAX_LLM_BACKTRACK_ATTEMPTS"]):
             print(f"  LLM Heal Attempt {attempt + 1}/{self.config['MAX_LLM_BACKTRACK_ATTEMPTS']}...")
-            prompt = f"""You are an expert Python dependency debugging AI. A project's validation fails with the following packages installed. Your task is to suggest a targeted downgrade of one or more packages to fix the runtime error.
             
+            # **FIXED HERE:** JSON example is now a separate variable to avoid f-string syntax errors.
+            example_json = '{"changes": [{"package": "numpy", "version": "1.26.4"}]}'
+            prompt = f"""You are an expert Python dependency debugging AI. A project's validation fails with the following packages installed. Your task is to suggest a targeted downgrade of one or more packages to fix the runtime error. Your response MUST be a single, valid JSON object and nothing else.
+
             Original unpinned requirements:
             ---
             {original_reqs}
@@ -158,7 +163,9 @@ class DependencyAgent:
             ---
             {error_log}
             ---
-            Propose a change. Respond ONLY with a JSON object like: {{"changes": [{{"package": "numpy", "version": "1.26.4"}}]}}"""
+            Propose a change. Respond ONLY with a JSON object like this example:
+            {example_json}
+            """
 
             try:
                 response = self.llm.generate_content(prompt)
@@ -182,7 +189,7 @@ class DependencyAgent:
                     self.exclusions_from_this_run.update(c['package'] for c in changes)
                     return result['packages'].split('\n')
                 else:
-                    error_log = new_error_log # Update error log for next attempt
+                    error_log = new_error_log
             except Exception as e:
                 print(f"  LLM attempt failed with an exception: {e}")
                 continue
@@ -194,13 +201,15 @@ class DependencyAgent:
 
         for i, suspect_spec in enumerate(sorted_suspects):
             pkg_name = self._get_package_name_from_spec(suspect_spec)
+            if '==' not in suspect_spec: continue
             current_ver = suspect_spec.split('==')[1]
+
             print(f"\nDeterministic Heal ({i+1}/{len(sorted_suspects)}): Testing downgrade for '{pkg_name}' (Risk Score: {risk_scores.get(pkg_name, 0):.2f})")
             
             versions = self.get_all_versions_between(pkg_name, "0.0.1", current_ver)
             if not versions: continue
             
-            prev_version = versions[-1] # Get the most recent previous version
+            prev_version = versions[-1]
             
             new_packages = [f"{pkg_name}=={prev_version}" if p == suspect_spec else p for p in failing_packages]
             
@@ -221,11 +230,9 @@ class DependencyAgent:
         is_pinned, _ = self._get_requirements_state()
         if not is_pinned:
             self._bootstrap_unpinned_requirements()
-            # After bootstrap, we need to re-read the state
             is_pinned, _ = self._get_requirements_state()
             if not is_pinned:
                  sys.exit("CRITICAL: Bootstrap process failed to produce a fully pinned requirements file.")
-
 
         dynamic_constraints = []
         final_successful_updates = {}
@@ -245,7 +252,7 @@ class DependencyAgent:
             packages_to_update = []
             for package, spec in original_requirements.items():
                 if package in self.exclusions_from_this_run:
-                    print(f"  Skipping {package} for this run due to bootstrap healing.")
+                    print(f"  Skipping '{package}' in this run's update plan due to recent bootstrap healing.")
                     continue
                 if '==' not in spec: continue
                 current_version = spec.split('==')[1]
@@ -349,7 +356,6 @@ class DependencyAgent:
             stable_versions = [p.version for p in page.packages if p.version and not parse_version(p.version).is_prerelease]
             if stable_versions:
                 return max(stable_versions, key=parse_version)
-            # Fallback to pre-releases if no stable versions are found
             all_versions = [p.version for p in page.packages if p.version]
             return max(all_versions, key=parse_version) if all_versions else None
         except Exception: return None
@@ -483,7 +489,7 @@ class DependencyAgent:
             page = self.pypi.get_project_page(package_name)
             if not (page and page.packages): return []
             start_v, end_v = parse_version(start_ver_str), parse_version(end_ver_str)
-            candidate_versions = {parse_version(p.version) for p in page.packages if p.version and start_v <= parse_version(p.version) < end_v and not parse_version(p.version).is_prerelease}
+            candidate_versions = {parse_version(p.version) for p in page.packages if p.version and start_v <= parse_version(p.version) < end_v and not getattr(parse_version(p.version), 'is_prerelease', False)}
             return sorted([str(v) for v in candidate_versions], key=parse_version)
         except Exception: return []
 
@@ -498,14 +504,19 @@ class DependencyAgent:
             return "(LLM Error: API quota exhausted)"
         except Exception as e:
             return f"(LLM Error: {type(e).__name__})"
+            
+    def _prune_pip_freeze(self, freeze_output):
+        lines = freeze_output.strip().split('\n')
+        return "\n".join([line for line in lines if '==' in line and not line.startswith('-e')])
 
     def _ask_llm_for_root_cause(self, package, error_message):
         if not self.llm_available: return {}
         py_version = f"{sys.version_info.major}.{sys.version_info.minor}"
         with open(self.config["REQUIREMENTS_FILE"], "r") as f:
             current_requirements = f.read()
-            
-        # Enhanced prompt for stricter JSON output
+        
+        # **FIXED HERE:** JSON example is now a separate variable to avoid f-string syntax errors.
+        example_json = '{"root_cause": "incompatibility", "package": "numpy", "suggested_constraint": "<2.0"}'
         prompt = f"""You are an expert Python dependency diagnostician AI. Your response MUST be a single, valid JSON object and nothing else.
         Analyze the error that occurred when updating '{package}' in a project with these requirements:
         ---
@@ -516,11 +527,10 @@ class DependencyAgent:
         {error_message}
         ---
         Respond with a JSON object. The 'root_cause' key must be either 'self' or 'incompatibility'. If 'incompatibility', you MUST also provide the 'package' and 'suggested_constraint' keys.
-        Example response: {{"root_cause": "incompatibility", "package": "numpy", "suggested_constraint": "<2.0"}}
+        Example response: {example_json}
         """
         try:
             response = self.llm.generate_content(prompt, request_options={"timeout": 100})
-            # Use a more robust regex to find the JSON blob
             match = re.search(r'\{[\s\S]*\}', response.text)
             if not match:
                 print("LLM Error: No JSON object found in the response.")
@@ -541,20 +551,19 @@ class DependencyAgent:
     def _ask_llm_for_version_candidates(self, package, failed_version):
         if not self.llm_available: return []
         
-        # Enhanced prompt for stricter list output
+        # **FIXED HERE:** Python list example is now a separate variable.
+        example_list = '["1.2.3", "1.2.2", "1.2.1"]'
         prompt = f"""You are a Python package versioning expert. Your response MUST be a single, valid Python list of strings and nothing else.
         Provide the {self.config['MAX_LLM_BACKTRACK_ATTEMPTS']} most recent, previous release versions of the python package '{package}', starting from the version just before '{failed_version}'. The list must be in descending order of version.
-        Example response: ["1.2.3", "1.2.2", "1.2.1"]
+        Example response: {example_list}
         """
         try:
             response = self.llm.generate_content(prompt, request_options={"timeout": 60})
-            # Use a more robust regex to find the list
             match = re.search(r'\[[\s\S]*\]', response.text)
             if not match:
                 print("LLM Error: No Python list found in the response.")
                 return []
             list_text = match.group(0)
-            # Use ast.literal_eval for safe evaluation of the list string
             return ast.literal_eval(list_text)
         except ResourceExhausted:
             self.llm_available = False
