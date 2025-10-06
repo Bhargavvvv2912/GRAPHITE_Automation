@@ -24,6 +24,8 @@ jobs:
 
       - name: Install agent dependencies
         run: pip install google-generativeai pypi-simple packaging
+      - name : Update API
+        run: pip install --upgrade google-generativeai
 
       - name: Run the Autonomous Agent
         run: python dependency_agent.py
