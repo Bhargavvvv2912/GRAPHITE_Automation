@@ -22,17 +22,8 @@ class DependencyAgent:
         self.primary_packages = self._load_primary_packages()
         self.llm_available = True
         self.usage_scores = self._calculate_risk_scores()
-        self.exclusions_from_this_run = set()
 
-    def _calculate_risk_scores(self, custom_package_list=None):
-        if custom_package_list:
-            start_group("Calculating Risk Scores for Custom Package List")
-            # Create scores based on pre-calculated usage, default to 1 if not found
-            scores = {self._get_package_name_from_spec(pkg): self.usage_scores.get(self._get_package_name_from_spec(pkg), 1) for pkg in custom_package_list}
-            print("Dynamic risk scores calculated for healing.")
-            end_group()
-            return scores
-            
+    def _calculate_risk_scores(self):
         start_group("Analyzing Codebase for Update Risk")
         scores = {}
         repo_root = Path('.')
@@ -69,173 +60,35 @@ class DependencyAgent:
             return {self._get_package_name_from_spec(line.strip()) for line in f if line.strip() and not line.startswith('#')}
 
     def _get_requirements_state(self):
-        if not self.requirements_path.exists():
-            print(f"Warning: {self.config['REQUIREMENTS_FILE']} not found. Assuming it needs to be created.", file=sys.stderr)
-            return False, []
+        if not self.requirements_path.exists(): sys.exit(f"Error: {self.config['REQUIREMENTS_FILE']} not found.")
         with open(self.requirements_path, "r") as f:
             lines = [line.strip() for line in f if line.strip() and not line.startswith('#')]
         return all('==' in line for line in lines), lines
 
-    def _run_bootstrap_and_validate(self, venv_dir, requirements_list):
-        python_executable = str(venv_dir / "bin" / "python")
-        if isinstance(requirements_list, Path) or isinstance(requirements_list, str):
-            pip_command = [python_executable, "-m", "pip", "install", "-r", str(requirements_list)]
-        else: # It's a list of packages
-            pip_command = [python_executable, "-m", "pip", "install"] + requirements_list
-            
-        _, stderr_install, returncode = run_command(pip_command)
-        if returncode != 0:
-            return False, None, f"Failed to install dependencies. Error: {stderr_install}"
-
-        success, metrics, validation_output = validate_changes(python_executable, group_title="Running Validation on New Baseline")
-        if not success:
-            return False, None, validation_output
-            
-        installed_packages, _, _ = run_command([python_executable, "-m", "pip", "freeze"])
-        return True, {"metrics": metrics, "packages": self._prune_pip_freeze(installed_packages)}, None
-
     def _bootstrap_unpinned_requirements(self):
-        start_group("BOOTSTRAP: Establishing a Stable Baseline")
-        print("Unpinned requirements detected. Creating and validating a stable baseline...")
-        venv_dir = Path("./bootstrap_venv")
+        print("Unpinned requirements detected. Creating a stable baseline...")
+        venv_dir = Path("./bootstrap_venv");
         if venv_dir.exists(): shutil.rmtree(venv_dir)
         venv.create(venv_dir, with_pip=True)
-        
-        success, result, error_log = self._run_bootstrap_and_validate(venv_dir, self.requirements_path)
-        
-        if success:
-            print("\nInitial baseline is valid and stable!")
-            with open(self.requirements_path, "w") as f:
-                f.write(result["packages"])
-            start_group("View new requirements.txt content"); print(result["packages"]); end_group()
-            if result["metrics"] and "not available" not in result["metrics"]:
-                print(f"\n{'='*70}\n=== BOOTSTRAP SUCCESSFUL: METRICS FOR THE NEW BASELINE ===\n" + "\n".join([f"  {line}" for line in result['metrics'].split('\n')]) + f"\n{'='*70}\n")
-                with open(self.config["METRICS_OUTPUT_FILE"], "w") as f:
-                    f.write(result["metrics"])
-            end_group()
-            return
-
-        print("\nCRITICAL: Initial baseline failed validation. Initiating Bootstrap Healing Protocol.", file=sys.stderr)
-        start_group("View Initial Baseline Failure Log"); print(error_log); end_group()
-        
         python_executable = str(venv_dir / "bin" / "python")
-        initial_failing_packages_list, _, _ = run_command([python_executable, "-m", "pip", "freeze"])
-        initial_failing_packages = self._prune_pip_freeze(initial_failing_packages_list).split('\n')
-
-        healed_packages = self._attempt_llm_bootstrap_heal(initial_failing_packages, error_log)
-        
-        if not healed_packages:
-            print("\nINFO: LLM healing failed. Falling back to Deterministic Downgrade Protocol.")
-            healed_packages = self._attempt_deterministic_bootstrap_heal(initial_failing_packages)
-
-        if healed_packages:
-            print("\nSUCCESS: Bootstrap Healing Protocol found a stable baseline.")
-            with open(self.requirements_path, "w") as f: f.write("\n".join(healed_packages))
-            start_group("View Healed and Pinned requirements.txt"); print("\n".join(healed_packages)); end_group()
-        else:
-            sys.exit("CRITICAL ERROR: All bootstrap healing attempts failed. Cannot establish a stable baseline.")
-        end_group()
-
-    def _attempt_llm_bootstrap_heal(self, failing_packages, error_log):
-        print("\nINFO: Attempting LLM-powered diagnosis for bootstrap failure.")
-        original_reqs = ""
-        try:
-            with open(self.requirements_path, 'r') as f: original_reqs = f.read()
-        except FileNotFoundError:
-             print("Could not read original requirements file for LLM context.")
-
-        # Define the example separately to ensure it is treated as a simple string.
-        example_json = '{"changes": [{"package": "numpy", "version": "1.26.4"}]}'
-
-        for attempt in range(self.config["MAX_LLM_BACKTRACK_ATTEMPTS"]):
-            print(f"  LLM Heal Attempt {attempt + 1}/{self.config['MAX_LLM_BACKTRACK_ATTEMPTS']}...")
-            
-            # **FIXED HERE:** Construct the prompt safely using concatenation to avoid f-string parsing issues.
-            failing_packages_str = "\n".join(failing_packages)
-            prompt_base = f"""You are an expert Python dependency debugging AI. A project's validation fails with the following packages installed. Your task is to suggest a targeted downgrade of one or more packages to fix the runtime error. Your response MUST be a single, valid JSON object and nothing else.
-
-            Original unpinned requirements:
-            ---
-            {original_reqs}
-            ---
-            Full list of failing installed packages:
-            ---
-            {failing_packages_str}
-            ---
-            Validation error log:
-            ---
-            {error_log}
-            ---
-            Propose a change. Respond ONLY with a JSON object like this example:
-            """
-            prompt = prompt_base + example_json
-
-            try:
-                response = self.llm.generate_content(prompt)
-                json_text = re.search(r'\{.*\}', response.text, re.DOTALL).group(0)
-                suggestion = json.loads(json_text)
-                changes = suggestion.get("changes", [])
-                if not changes: continue
-
-                new_packages = list(failing_packages)
-                for change in changes:
-                    pkg_name, new_ver = change['package'], change['version']
-                    new_packages = [f"{pkg_name}=={new_ver}" if self._get_package_name_from_spec(p) == pkg_name else p for p in new_packages]
-
-                venv_dir = Path("./bootstrap_venv");
-                if venv_dir.exists(): shutil.rmtree(venv_dir)
-                venv.create(venv_dir, with_pip=True)
-                
-                success, result, new_error_log = self._run_bootstrap_and_validate(venv_dir, new_packages)
-                if success:
-                    print(f"  LLM SUCCEEDED. Found a stable baseline with changes: {changes}")
-                    self.exclusions_from_this_run.update(c['package'] for c in changes)
-                    return result['packages'].split('\n')
-                else:
-                    error_log = new_error_log
-            except Exception as e:
-                print(f"  LLM attempt failed with an exception: {e}")
-                continue
-        return None
-        
-    def _attempt_deterministic_bootstrap_heal(self, failing_packages):
-        risk_scores = self._calculate_risk_scores(custom_package_list=failing_packages)
-        sorted_suspects = sorted(failing_packages, key=lambda p: risk_scores.get(self._get_package_name_from_spec(p), 0), reverse=True)
-
-        for i, suspect_spec in enumerate(sorted_suspects):
-            pkg_name = self._get_package_name_from_spec(suspect_spec)
-            if '==' not in suspect_spec: continue
-            current_ver = suspect_spec.split('==')[1]
-
-            print(f"\nDeterministic Heal ({i+1}/{len(sorted_suspects)}): Testing downgrade for '{pkg_name}' (Risk Score: {risk_scores.get(pkg_name, 0):.2f})")
-            
-            versions = self.get_all_versions_between(pkg_name, "0.0.1", current_ver)
-            if not versions: continue
-            
-            prev_version = versions[-1]
-            
-            new_packages = [f"{pkg_name}=={prev_version}" if p == suspect_spec else p for p in failing_packages]
-            
-            venv_dir = Path("./bootstrap_venv")
-            if venv_dir.exists(): shutil.rmtree(venv_dir)
-            venv.create(venv_dir, with_pip=True)
-
-            success, result, _ = self._run_bootstrap_and_validate(venv_dir, new_packages)
-            if success:
-                print(f"  Deterministic Heal SUCCEEDED. Found culprit: '{pkg_name}'. Stable at version {prev_version}.")
-                self.exclusions_from_this_run.add(pkg_name)
-                return result['packages'].split('\n')
-
-        return None
+        _, stderr, returncode = run_command([python_executable, "-m", "pip", "install", "-r", str(self.requirements_path)])
+        if returncode != 0: sys.exit(f"CRITICAL ERROR: Failed to install initial set of dependencies. Error: {stderr}")
+        success, metrics, _ = validate_changes(python_executable, group_title="Running Validation on New Baseline")
+        if not success: sys.exit("CRITICAL ERROR: Initial dependencies failed validation.")
+        if metrics and "not available" not in metrics:
+            print(f"\n{'='*70}\n=== BOOTSTRAP SUCCESSFUL: METRICS FOR THE NEW BASELINE ===\n" + "\n".join([f"  {line}" for line in metrics.split('\n')]) + f"\n{'='*70}\n")
+        installed_packages, _, _ = run_command([python_executable, "-m", "pip", "freeze"])
+        with open(self.requirements_path, "w") as f: f.write(self._prune_pip_freeze(installed_packages))
+        start_group("View new requirements.txt content"); print(installed_packages); end_group()
+        if metrics:
+            with open(self.config["METRICS_OUTPUT_FILE"], "w") as f: f.write(metrics)
 
     def run(self):
         if os.path.exists(self.config["METRICS_OUTPUT_FILE"]): os.remove(self.config["METRICS_OUTPUT_FILE"])
         is_pinned, _ = self._get_requirements_state()
         if not is_pinned:
             self._bootstrap_unpinned_requirements()
-            is_pinned, _ = self._get_requirements_state()
-            if not is_pinned:
-                 sys.exit("CRITICAL: Bootstrap process failed to produce a fully pinned requirements file.")
+            return
 
         dynamic_constraints = []
         final_successful_updates = {}
@@ -254,9 +107,6 @@ class DependencyAgent:
             
             packages_to_update = []
             for package, spec in original_requirements.items():
-                if package in self.exclusions_from_this_run:
-                    print(f"  Skipping '{package}' in this run's update plan due to recent bootstrap healing.")
-                    continue
                 if '==' not in spec: continue
                 current_version = spec.split('==')[1]
                 latest_version = self.get_latest_version(package)
@@ -264,7 +114,7 @@ class DependencyAgent:
                     packages_to_update.append((package, current_version, latest_version))
             
             if not packages_to_update:
-                if pass_num == 1 and not self.exclusions_from_this_run: print("\nAll dependencies are up-to-date.")
+                if pass_num == 1: print("\nAll dependencies are up-to-date.")
                 else: print("\nNo further updates possible. System has converged.")
                 end_group()
                 break
@@ -354,13 +204,10 @@ class DependencyAgent:
 
     def get_latest_version(self, package_name):
         try:
-            page = self.pypi.get_project_page(package_name)
-            if not (page and page.packages): return None
-            stable_versions = [p.version for p in page.packages if p.version and not parse_version(p.version).is_prerelease]
-            if stable_versions:
-                return max(stable_versions, key=parse_version)
-            all_versions = [p.version for p in page.packages if p.version]
-            return max(all_versions, key=parse_version) if all_versions else None
+            package_info = self.pypi.get_project_page(package_name)
+            if not (package_info and package_info.packages): return None
+            stable_versions = [p.version for p in package_info.packages if p.version and not parse_version(p.version).is_prerelease]
+            return max(stable_versions, key=parse_version) if stable_versions else max([p.version for p in package_info.packages if p.version], key=parse_version)
         except Exception: return None
 
     def _try_install_and_validate(self, package_to_update, new_version, dynamic_constraints, old_version, is_probe, changed_packages):
@@ -368,17 +215,16 @@ class DependencyAgent:
         if venv_dir.exists(): shutil.rmtree(venv_dir)
         venv.create(venv_dir, with_pip=True)
         python_executable = str(venv_dir / "bin" / "python")
-        
         with open(self.requirements_path, "r") as f:
-            lines = [line.strip() for line in f if line.strip()]
+             lines = [line.strip() for line in f if line.strip()]
         
         requirements_list = [f"{package_to_update}=={new_version}" if self._get_package_name_from_spec(l) == package_to_update else l for l in lines]
-        requirements_list.extend(c for c in dynamic_constraints if self._get_package_name_from_spec(c) != package_to_update)
-
+        requirements_list.extend(dynamic_constraints)
+        
         if not is_probe:
             start_group(f"Attempting to install {package_to_update}=={new_version}")
             print(f"\nChange analysis: Updating '{package_to_update}' from {old_version} -> {new_version}")
-
+        
         _, stderr_install, returncode = run_command([python_executable, "-m", "pip", "install"] + requirements_list)
         
         if not is_probe: end_group()
@@ -387,9 +233,10 @@ class DependencyAgent:
             llm_summary = self._ask_llm_to_summarize_error(stderr_install)
             reason = f"Installation conflict. Summary: {llm_summary}"
             return False, reason, stderr_install
-
-        if new_version == old_version and not changed_packages:
-             print("\n--> SKIPPING validation because no effective version change has occurred.")
+        
+        is_upgrade = new_version != old_version
+        if not is_upgrade and not changed_packages:
+             print("\n--> STEP 2: SKIPPING validation because no effective change has occurred.")
              return True, "Validation skipped (no change)", ""
 
         group_title = f"Validation for {package_to_update}=={new_version}"
@@ -418,14 +265,14 @@ class DependencyAgent:
         version_candidates = self._ask_llm_for_version_candidates(package, target_version)
         if version_candidates:
             for candidate in version_candidates:
-                if parse_version(candidate) <= parse_version(current_version): continue
+                if parse_version(candidate) < parse_version(current_version): continue
                 print(f"INFO: Attempting LLM-suggested backtrack for {package} to {candidate}")
                 success, result_data, _ = self._try_install_and_validate(package, candidate, dynamic_constraints, old_version=current_version, is_probe=False, changed_packages=changed_packages_this_pass)
                 if success:
                     self._handle_success(package, candidate, result_data, package_label)
                     return True, candidate, None
 
-        print(f"INFO: LLM suggestions failed. Falling back to Binary Search backtracking.")
+        print(f"INFO: LLM suggestions failed. Falling back to Classic Binary Search.")
         success_package = self._binary_search_backtrack(package, current_version, target_version, dynamic_constraints, changed_packages_this_pass)
         if success_package:
             found_version = success_package["version"]
@@ -438,7 +285,7 @@ class DependencyAgent:
         if metrics and "not available" not in metrics:
             print(f"\n** SUCCESS: {package} {package_label} finalized at {new_version} and passed validation. **")
             print("\n".join([f"  {line}" for line in metrics.split('\n')]) + "\n")
-            with open(self.config["METRICS_OUTPUT_FILE"], "a") as f: f.write(metrics + "\n\n")
+            with open(self.config["METRICS_OUTPUT_FILE"], "w") as f: f.write(metrics)
         else:
             print(f"\n** SUCCESS: {package} {package_label} finalized at {new_version} and passed (metrics unavailable). **\n")
         
@@ -453,6 +300,7 @@ class DependencyAgent:
         versions = self.get_all_versions_between(package, last_good_version, failed_version)
         if not versions:
             print(f"Binary Search: No candidate versions found between {last_good_version} and {failed_version}.")
+            # Fallback to check if the last good version is still valid
             success, metrics, _ = self._try_install_and_validate(package, last_good_version, dynamic_constraints, is_probe=True, changed_packages=changed_packages, old_version=last_good_version)
             if success:
                 print(f"Binary Search SUCCESS: Re-validated last good version {last_good_version} as the only stable option.")
@@ -489,24 +337,20 @@ class DependencyAgent:
 
     def get_all_versions_between(self, package_name, start_ver_str, end_ver_str):
         try:
-            page = self.pypi.get_project_page(package_name)
-            if not (page and page.packages): return []
+            package_info = self.pypi.get_project_page(package_name)
+            if not (package_info and package_info.packages): return []
             start_v, end_v = parse_version(start_ver_str), parse_version(end_ver_str)
-            candidate_versions = {parse_version(p.version) for p in page.packages if p.version and start_v <= parse_version(p.version) < end_v and not getattr(parse_version(p.version), 'is_prerelease', False)}
-            return sorted([str(v) for v in candidate_versions], key=parse_version)
+            candidate_versions = [v for p in package_info.packages if p.version and start_v <= (v := parse_version(p.version)) < end_v]
+            return sorted([str(v) for v in set(candidate_versions)], key=parse_version)
         except Exception: return []
 
     def _ask_llm_to_summarize_error(self, error_message):
-        if not self.llm_available: return "(LLM unavailable)"
-        prompt = f"Summarize the root cause of this Python pip install error in one concise sentence. Error Log: --- {error_message} ---"
+        if not self.llm_available: return "(LLM unavailable due to quota)"
+        prompt = f"The following is a Python pip install error log. Please summarize the root cause of the conflict in a single, concise sentence. Error Log: --- {error_message} ---"
         try:
-            response = self.llm.generate_content(prompt, request_options={"timeout": 60})
+            response = self.llm.generate_content(prompt)
             return response.text.strip().replace('\n', ' ')
-        except ResourceExhausted:
-            self.llm_available = False
-            return "(LLM Error: API quota exhausted)"
-        except Exception as e:
-            return f"(LLM Error: {type(e).__name__})"
+        except Exception: return "Failed to get summary from LLM."
             
     def _prune_pip_freeze(self, freeze_output):
         lines = freeze_output.strip().split('\n')
@@ -517,64 +361,29 @@ class DependencyAgent:
         py_version = f"{sys.version_info.major}.{sys.version_info.minor}"
         with open(self.config["REQUIREMENTS_FILE"], "r") as f:
             current_requirements = f.read()
-        
-        # **FIXED HERE:** JSON example is now a separate variable to avoid f-string syntax errors.
-        example_json = '{"root_cause": "incompatibility", "package": "numpy", "suggested_constraint": "<2.0"}'
-        prompt = f"""You are an expert Python dependency diagnostician AI. Your response MUST be a single, valid JSON object and nothing else.
-        Analyze the error that occurred when updating '{package}' in a project with these requirements:
-        ---
-        {current_requirements}
-        ---
-        The error on Python {py_version} was:
-        ---
-        {error_message}
-        ---
-        Respond with a JSON object. The 'root_cause' key must be either 'self' or 'incompatibility'. If 'incompatibility', you MUST also provide the 'package' and 'suggested_constraint' keys.
-        Example response: {example_json}
-        """
+        prompt = f"""You are an expert Python dependency diagnostician AI. Analyze the error that occurred when updating '{package}' in a project with these requirements:
+---
+{current_requirements}
+---
+The error on Python {py_version} was:
+---
+{error_message}
+---
+Respond in JSON. Is the root_cause 'self' or 'incompatibility'? If incompatibility, name the 'package' and 'suggested_constraint'. Example: {{"root_cause": "incompatibility", "package": "numpy", "suggested_constraint": "<2.0"}}"""
         try:
-            response = self.llm.generate_content(prompt, request_options={"timeout": 100})
-            match = re.search(r'\{[\s\S]*\}', response.text)
-            if not match:
-                print("LLM Error: No JSON object found in the response.")
-                return {}
-            json_text = match.group(0)
+            response = self.llm.generate_content(prompt)
+            json_text = re.search(r'\{.*\}', response.text, re.DOTALL).group(0)
             return json.loads(json_text)
-        except ResourceExhausted:
-            self.llm_available = False
-            print("LLM Error: API quota exhausted for root cause analysis.")
-            return {}
-        except json.JSONDecodeError:
-            print(f"LLM Error: Failed to decode JSON from response: {response.text}")
-            return {}
-        except Exception as e:
-            print(f"LLM Error during root cause analysis: {type(e).__name__} - {e}")
-            return {}
+        except Exception: return {}
 
     def _ask_llm_for_version_candidates(self, package, failed_version):
         if not self.llm_available: return []
-        
-        # **FIXED HERE:** Python list example is now a separate variable.
-        example_list = '["1.2.3", "1.2.2", "1.2.1"]'
-        prompt = f"""You are a Python package versioning expert. Your response MUST be a single, valid Python list of strings and nothing else.
-        Provide the {self.config['MAX_LLM_BACKTRACK_ATTEMPTS']} most recent, previous release versions of the python package '{package}', starting from the version just before '{failed_version}'. The list must be in descending order of version.
-        Example response: {example_list}
-        """
+        prompt = f"Give a Python list of the {self.config['MAX_LLM_BACKTRACK_ATTEMPTS']} most recent, previous release versions of the python package '{package}', starting from the version just before '{failed_version}'. The list must be in descending order. Respond ONLY with the list."
         try:
-            response = self.llm.generate_content(prompt, request_options={"timeout": 60})
-            match = re.search(r'\[[\s\S]*\]', response.text)
-            if not match:
-                print("LLM Error: No Python list found in the response.")
-                return []
-            list_text = match.group(0)
-            return ast.literal_eval(list_text)
+            response = self.llm.generate_content(prompt)
+            match = re.search(r'(\[.*?\])', response.text, re.DOTALL)
+            if not match: return []
+            return ast.literal_eval(match.group(1))
         except ResourceExhausted:
-            self.llm_available = False
-            print("LLM Error: API quota exhausted for version candidates.")
-            return []
-        except (ValueError, SyntaxError):
-            print(f"LLM Error: Failed to parse Python list from response: {response.text}")
-            return []
-        except Exception as e:
-            print(f"LLM Error during version candidate search: {type(e).__name__} - {e}")
-            return []
+            self.llm_available = False; return []
+        except Exception: return []
