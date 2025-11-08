@@ -1,7 +1,9 @@
-# agent_utils.py
+# agent_utils.py (The Final, Complete, Config-Driven Oracle)
 
 import subprocess
 import re
+import sys
+from pathlib import Path
 
 def start_group(title):
     """Starts a collapsible log group in GitHub Actions."""
@@ -11,18 +13,14 @@ def end_group():
     """Ends a collapsible log group in GitHub Actions."""
     print("::endgroup::")
 
-def run_command(command, cwd=None, python_executable=None):
+def run_command(command, cwd=None, display_command=True):
     """Runs a command and returns the output, error, and return code."""
-    full_command = command
-    if python_executable and command[0].startswith('python'):
-        full_command = [python_executable] + command[1:]
-    
-    display_command = ' '.join(full_command)
-    if len(display_command) > 200:
-        display_command = display_command[:200] + "..."
-    print(f"Running command: {display_command}")
-    
-    result = subprocess.run(full_command, capture_output=True, text=True, cwd=cwd)
+    # --- START OF CHANGE ---
+    if display_command:
+        display_str = ' '.join(command)
+        print(f"--> Running command: '{display_str}' in CWD: '{cwd or '.'}'")
+    # --- END OF CHANGE ---
+    result = subprocess.run(command, capture_output=True, text=True, cwd=cwd)
     return result.stdout, result.stderr, result.returncode
 
 def validate_changes(python_executable, group_title="Running Validation Script"):

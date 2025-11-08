@@ -1,4 +1,4 @@
-name: Autonomous Dependency Updater
+name: Autonomous Dependency Updater for Requests
 
 on:
   workflow_dispatch:
@@ -14,77 +14,78 @@ jobs:
         working-directory: ${{ github.workspace }}
 
     steps:
-      - name: Checkout repository
+      - name: Checkout Experiment Repository
         uses: actions/checkout@v4
+
+      - name: Clone Requests Repository
+        run: git clone https://github.com/psf/requests.git
 
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - name: Install agent dependencies
-        run: pip install google-generativeai pypi-simple packaging
-      - name : Update API
-        run: pip install --upgrade google-generativeai
+      - name: Cache pip packages
+        uses: actions/cache@v3
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements-dev.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Force Install Latest Agent Dependencies
+        run: |
+          # 1. THE NUKE: This is the critical step.
+          python -m pip uninstall -y google-generativeai
+          
+          # 2. THE PAVE: Now, pip has no choice.
+          python -m pip install google-generativeai pypi-simple packaging
 
       - name: Run the Autonomous Agent
         run: python dependency_agent.py
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+
+      # --- ADD THIS NEW STEP ---
+      - name: Configure git to ignore temporary directories
+        run: |
+          echo "Configuring git to ignore agent artifacts for this run..."
+          # Create a git exclude file for this run
+          echo "/temp_venv/" >> .git/info/exclude
+          echo "/final_venv/" >> .git/info/exclude
+          echo "/bootstrap_venv/" >> .git/info/exclude
+          echo "/temp_pip_check/" >> .git/info/exclude
+          echo "/requests/" >> .git/info/exclude
+      # --- END OF NEW STEP ---
       
       - name: Commit and push changes if any
         run: |
-          git config --global user.name 'Dependency Agent'
-          git config --global user.email 'agent@users.noreply.github.com'
+          git config --global user.name 'AURA Dependency Agent'
+          git config --global user.email 'aura-agent@users.noreply.github.com'
           
-          # Check if either of the agent-managed files have changed
-          if ! git diff --quiet requirements.txt && ! git diff --quiet metrics_history.json; then
+          TARGET_FILE="requirements-dev.txt"
+          
+          # First, ensure the git index is up-to-date with what's on disk.
+          git add $TARGET_FILE
+          
+          # Now, compare the staged changes (what's on disk) with the latest commit.
+          # If there are no staged changes, this command will be quiet.
+          if git diff-index --quiet HEAD; then
             echo "No dependency changes to commit."
             exit 0
           fi
           
-          echo "Dependencies updated. Committing changes with metrics."
+          echo "Dependencies have changed. Committing and pushing..."
           
-          COMMIT_BODY="Performance metrics for the new dependency set."
+          COMMIT_BODY="Automated dependency updates for the Requests library."
           if [ -f metrics_output.txt ]; then
             COMMIT_BODY=$(cat metrics_output.txt)
           fi
           
-          # Add both requirements.txt and the history file to the commit
-          git add requirements.txt metrics_history.json
+          # The file is already added, we just need to commit.
+          git commit -m "chore(deps): Autonomously manage requests dependencies [skip ci]" -m "$COMMIT_BODY"
           
-          # Use [skip ci] to prevent infinite loops
-          git commit -m "chore(deps): Autonomously update dependencies [skip ci]" -m "$COMMIT_BODY"
-          
-          # Clean up the temporary metrics file
-          rm -f metrics_output.txt
-
           git push
 
-  validate-on-other-versions:
-    # This job only runs if the main job made a commit, which means this check is implicitly handled.
-    needs: update-dependencies
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: ${{ github.workspace }}
-    strategy:
-      matrix:
-        python-version: ['3.10', '3.11', '3.12']
-    
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
-        with:
-          python-version: ${{ matrix.python-version }}
-
-      - name: Install updated dependencies
-        run: pip install -r requirements.txt
-
-      - name: Run validation on Python ${{ matrix.python-version }}
-        run: |
-          bash ./make_output_folders.sh
-          python3 main.py -v 14 -t 1 --tr_lo 0.65 --tr_hi 0.85 -s score.py -n GTSRB --heatmap=Target --coarse_mode=binary -b 100 -m 100
+  
+  
