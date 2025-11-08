@@ -22,7 +22,7 @@ if __name__ == "__main__":
         sys.exit("Error: GEMINI_API_KEY environment variable not set.")
     
     genai.configure(api_key=GEMINI_API_KEY)
-    llm_client = genai.GenerativeModel('gemini-1.5-flash')
+    llm_client = genai.GenerativeModel('gemini-2.5-flash')
 
     agent = DependencyAgent(config=AGENT_CONFIG, llm_client=llm_client)
     agent.run()
