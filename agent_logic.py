@@ -136,9 +136,7 @@ class DependencyAgent:
             
         installed_packages, _, _ = run_command([python_executable, "-m", "pip", "freeze"])
         return True, {"metrics": metrics, "packages": self._prune_pip_freeze(installed_packages)}, None
-
-   # In agent_logic.py
-
+    
     def run(self):
         if os.path.exists(self.config["METRICS_OUTPUT_FILE"]):
             os.remove(self.config["METRICS_OUTPUT_FILE"])

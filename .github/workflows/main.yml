@@ -63,7 +63,7 @@ jobs:
           git config --global user.name 'AURA Dependency Agent'
           git config --global user.email 'aura-agent@users.noreply.github.com'
           
-          TARGET_FILE="requirements-dev.txt"
+          TARGET_FILE="requirements.txt"
           
           # First, ensure the git index is up-to-date with what's on disk.
           git add $TARGET_FILE
