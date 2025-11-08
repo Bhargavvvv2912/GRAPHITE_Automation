@@ -6,6 +6,9 @@ from agent_logic import DependencyAgent
 
 # --- Configuration ---
 AGENT_CONFIG = {
+    "VALIDATION_CONFIG": {
+        "type": "script" 
+    },
     "REQUIREMENTS_FILE": "requirements.txt",
     "PRIMARY_REQUIREMENTS_FILE": "primary_requirements.txt",
     "METRICS_OUTPUT_FILE": "metrics_output.txt",
