@@ -130,7 +130,7 @@ class DependencyAgent:
         if returncode != 0:
             return False, None, f"Failed to install dependencies. Error: {stderr_install}"
 
-        success, metrics, validation_output = validate_changes(python_executable, group_title="Running Validation on New Baseline")
+        success, metrics, validation_output = validate_changes(python_executable, self.config, group_title="Running Validation on New Baseline")
         if not success:
             return False, None, validation_output
             
@@ -288,7 +288,7 @@ class DependencyAgent:
         _, stderr, returncode = run_command([python_executable, "-m", "pip", "install", "-r", str(self.requirements_path)])
         if returncode != 0:
             print("CRITICAL ERROR: Final installation of combined dependencies failed!", file=sys.stderr); return
-        success, metrics, _ = validate_changes(python_executable, group_title="Final System Health Check")
+        success, metrics, _ = validate_changes(python_executable, self.config, group_title="Final System Health Check")
         if success and metrics and "not available" not in metrics:
             print("\n" + "="*70); print("=== FINAL METRICS FOR THE FULLY UPDATED ENVIRONMENT ==="); print("\n".join([f"  {line}" for line in metrics.split('\n')])); print("="*70)
         elif success:
@@ -365,7 +365,7 @@ class DependencyAgent:
             return False, reason, stderr_install
         
         print("--> Installation successful. Running validation suite...")
-        success, metrics, validation_output = validate_changes(python_executable, group_title=f"Running Validation on {package_to_update}=={new_version}")
+        success, metrics, validation_output = validate_changes(python_executable, self.config, group_title=f"Running Validation on {package_to_update}=={new_version}")
 
         if not success:
             print("--> ERROR: Validation script failed.")
