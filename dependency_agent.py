@@ -24,8 +24,6 @@ AGENT_CONFIG = {
         "type": "script",
         # It correctly points to our dedicated validation script for this project.
         "smoke_test_script": "validation_graphite.py",
-        # It specifies the directory where the cloned project lives.
-        "project_dir": "graphite_repo" 
     },
     
     # All other standard settings

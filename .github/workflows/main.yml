@@ -18,7 +18,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Clone Requests Repository
-        run: git clone https://github.com/psf/requests.git graphite_repo
+        run: git clone https://github.com/psf/requests.git 
 
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
