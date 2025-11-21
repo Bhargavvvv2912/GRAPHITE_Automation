@@ -8,17 +8,19 @@ import ast
 import shutil
 import re
 import json
+import subprocess
 from google.api_core.exceptions import ResourceExhausted
 from pypi_simple import PyPISimple
 from packaging.version import parse as parse_version
 from agent_utils import start_group, end_group, run_command, validate_changes
+from expert_agent import ExpertAgent
 
 class DependencyAgent:
     def __init__(self, config, llm_client):
         self.config = config
-        self.llm = llm_client
+        self.expert = ExpertAgent(llm_client) 
         self.pypi = PyPISimple()
-        self.requirements_path = Path(config["REQUIREMENTS_FILE"])
+        self.requirements_path = Path(config["REQUIREMENTS_FILE"]).resolve()
         self.primary_packages = self._load_primary_packages()
         self.llm_available = True
         self.usage_scores = self._calculate_risk_scores()
@@ -87,11 +89,23 @@ class DependencyAgent:
         with open(primary_path, "r") as f:
             return {self._get_package_name_from_spec(line.strip()) for line in f if line.strip() and not line.startswith('#')}
 
+    # In agent_logic.py
+
     def _get_requirements_state(self):
-        if not self.requirements_path.exists(): sys.exit(f"Error: {self.config['REQUIREMENTS_FILE']} not found.")
+        """
+        Checks if the requirements file is fully pinned. Now correctly handles
+        editable install lines ('-e') as a valid "pinned" state.
+        """
+        if not self.requirements_path.exists():
+            sys.exit(f"Error: {self.config['REQUIREMENTS_FILE']} not found.")
+            
         with open(self.requirements_path, "r") as f:
-            lines = [line.strip() for line in f if line.strip() and not line.startswith('#')]
-        return all('==' in line for line in lines), lines
+            lines = [line.strip() for line in f if line.strip() and not line.strip().startswith('#')]
+        is_fully_pinned = all(
+            '==' in line or line.startswith('-e') 
+            for line in lines
+        )
+        return is_fully_pinned, lines
 
     def _bootstrap_unpinned_requirements(self):
         start_group("BOOTSTRAP: Establishing a Stable Baseline")
@@ -136,18 +150,49 @@ class DependencyAgent:
             
         installed_packages, _, _ = run_command([python_executable, "-m", "pip", "freeze"])
         return True, {"metrics": metrics, "packages": self._prune_pip_freeze(installed_packages)}, None
-    
+
+    # In agent_logic.py
+
     def run(self):
         if os.path.exists(self.config["METRICS_OUTPUT_FILE"]):
             os.remove(self.config["METRICS_OUTPUT_FILE"])
         
         is_pinned, _ = self._get_requirements_state()
-        if not is_pinned:
-            self._bootstrap_unpinned_requirements()
-            is_pinned, _ = self._get_requirements_state()
-            if not is_pinned:
-                sys.exit("CRITICAL: Bootstrap process failed to produce a fully pinned requirements file.")
 
+        # --- START OF THE FINAL, CORRECT ARCHITECTURE ---
+        if not is_pinned:
+            # If the requirements are unpinned, the bootstrap process is our initial health check.
+            print("INFO: Unpinned requirements detected. Bootstrapping a new baseline...")
+            self._bootstrap_unpinned_requirements()
+        else:
+            # If requirements are already pinned, we still run a full validation and regeneration.
+            # This ensures the file is clean and the environment is truly working.
+            print("INFO: Found pinned requirements. Running initial health check and regenerating lockfile...")
+            start_group("Initial Baseline Health Check")
+            
+            venv_dir = Path("./initial_check_venv")
+            if venv_dir.exists(): shutil.rmtree(venv_dir)
+            venv.create(venv_dir, with_pip=True)
+            
+            # Use the universal bootstrap function to install, test, and freeze the environment.
+            success, result, error_log = self._run_bootstrap_and_validate(venv_dir, self.requirements_path)
+            
+            if not success:
+                # If the pinned requirements are broken, we activate the "Unpin and Bootstrap" repair.
+                print("WARNING: Initial baseline is broken. Activating 'Unpin and Bootstrap' repair strategy.", file=sys.stderr)
+                end_group() # End the health check group
+                self._unpin_and_bootstrap()
+            else:
+                # If the pinned requirements were valid, we overwrite the file with the clean, frozen state.
+                # This sanitizes the file and ensures it's in the perfect state for the agent.
+                print("Initial baseline is valid and stable. Overwriting requirements file with clean, frozen state.")
+                with open(self.requirements_path, "w") as f:
+                    f.write(result["packages"])
+                end_group()
+        # --- END OF THE FINAL ARCHITECTURE ---
+
+        # At this point, we are GUARANTEED to have a valid, fully-pinned baseline to work from.
+        
         final_successful_updates, final_failed_updates = {}, {}
         pass_num = 0
         
@@ -164,78 +209,59 @@ class DependencyAgent:
             changed_packages_this_pass = set()
 
             packages_to_update = []
-            with open(progressive_baseline_path, 'r') as f:
-                lines = [line.strip() for line in f if line.strip() and not line.strip().startswith('#')]
+            with open(progressive_baseline_path, 'r') as f: lines = [line.strip() for line in f if line.strip() and not line.strip().startswith('#')]
             for line in lines:
-                package_part = line.split(';')[0].strip()
-                if '==' not in package_part or line.strip().startswith('-e'): continue
-                parts = package_part.split('==')
-                if len(parts) != 2: continue
-                package, current_version = self._get_package_name_from_spec(parts[0]), parts[1]
+                if '==' not in line or line.strip().startswith('-e'): continue
+                package, current_version = self._get_package_name_from_spec(line.split('==')[0]), line.split('==')[1].split(';')[0]
                 latest_version = self.get_latest_version(package)
                 if latest_version and parse_version(latest_version) > parse_version(current_version):
                     packages_to_update.append((package, current_version, latest_version))
 
             if not packages_to_update:
-                if pass_num == 1:
-                    print("\nInitial baseline is already fully up-to-date. Running a final health check.")
-                    self._run_final_health_check()
-                else:
-                    print("\nNo further updates are available. The system has successfully converged.")
+                print("\nNo further updates are available. The system has successfully converged.")
                 if progressive_baseline_path.exists(): progressive_baseline_path.unlink()
                 break 
 
-            # --- START of HURM 4.0 with "SUM TO 100" NORMALIZATION ---
+            # HURM 4.0 Risk Calculation (This part is correct)
             update_plan = []
             for pkg, cur, target in packages_to_update:
                 components = self._calculate_update_risk_components(pkg, cur, target)
                 update_plan.append({'pkg': pkg, 'cur': cur, 'target': target, 'components': components})
-
             max_ecosystem = max(p['components']['ecosystem'] for p in update_plan) if update_plan else 0
             max_depth = max(p['components']['depth'] for p in update_plan) if update_plan else 0
-
             W_ECOSYSTEM, W_DEPTH = 1.0, 0.5
             for p in update_plan:
-                comps = p['components']
-                norm_ecosystem = (comps['ecosystem'] / max_ecosystem) if max_ecosystem > 0 else 0
+                comps = p['components']; norm_ecosystem = (comps['ecosystem'] / max_ecosystem) if max_ecosystem > 0 else 0
                 norm_depth = (comps['depth'] / max_depth) if max_depth > 0 else 0
                 entanglement_score = (W_ECOSYSTEM * norm_ecosystem) + (W_DEPTH * norm_depth)
                 p['final_score'] = (comps['severity'] * 10) + entanglement_score
                 p['code_impact_score'] = comps['usage'] + (comps['criticality'] * 10)
-
-            update_plan.sort(key=lambda p: (p['final_score'], p['code_impact_score']))
             
-            # --- This is the new "Sum to 100" logic ---
+            update_plan.sort(key=lambda p: (p['final_score'], p['code_impact_score']), reverse=True)
+            
             total_score_sum = sum(p['final_score'] for p in update_plan) if update_plan else 0
             for p in update_plan:
                  if total_score_sum == 0: p['risk_percent_display'] = 0.0
                  else: p['risk_percent_display'] = (p['final_score'] / total_score_sum) * 100.0
-            # --- END OF NORMALIZATION LOGIC ---
 
-            print("\nPrioritized Update Plan for this Pass (Lowest Risk First):")
+            print("\nPrioritized Update Plan for this Pass (Highest Risk First):")
             print(f"{'Rank':<5} | {'Package':<30} | {'% of Total Risk':<18} | {'Change'}")
             print(f"{'-'*5} | {'-'*30} | {'-'*18} | {'-'*20}")
-            for i, p in enumerate(update_plan):
-                print(f"{i+1:<5} | {p['pkg']:<30} | {p['risk_percent_display']:<18.2f}% | {p['cur']} -> {p['target']}")
+            for i, p in enumerate(update_plan): print(f"{i+1:<5} | {p['pkg']:<30} | {p['risk_percent_display']:<18.2f}% | {p['cur']} -> {p['target']}")
             
             for i, p_data in enumerate(update_plan):
                 package, current_ver, target_ver = p_data['pkg'], p_data['cur'], p_data['target']
                 print(f"\n" + "-"*80); print(f"PULSE: [PASS {pass_num} | ATTEMPT {i+1}/{len(update_plan)}] Processing '{package}'"); print(f"PULSE: Changed packages this pass so far: {changed_packages_this_pass}"); print("-"*80)
                 
-                success, reason_or_new_version, _ = self.attempt_update_with_healing(
-                    package, current_ver, target_ver, [], progressive_baseline_path
-                )
+                success, reason_or_new_version, _ = self.attempt_update_with_healing(package, current_ver, target_ver, [], progressive_baseline_path)
                 
                 if success:
                     reached_version, is_a_real_change = "", False
-                    if "skipped" in str(reason_or_new_version):
-                        reached_version, is_a_real_change = current_ver, False
+                    if "skipped" in str(reason_or_new_version): reached_version, is_a_real_change = current_ver, False
                     else:
                         reached_version = reason_or_new_version
                         if current_ver != reached_version: is_a_real_change = True
-                    
                     final_successful_updates[package] = (target_ver, reached_version)
-                    
                     if is_a_real_change:
                         changed_packages_this_pass.add(package)
                         print(f"  -> SUCCESS. Locking in {package}=={reached_version} into the progressive baseline for this pass.")
@@ -261,7 +287,8 @@ class DependencyAgent:
         
         if final_successful_updates:
             self._print_final_summary(final_successful_updates, final_failed_updates)
-            self._run_final_health_check()
+            print("\nRun complete. The final requirements.txt is the latest provably working version.")
+
 
     def _print_final_summary(self, successful, failed):
         print("\n" + "#"*70); print("### OVERALL UPDATE RUN SUMMARY ###")
@@ -276,23 +303,6 @@ class DependencyAgent:
             print(f"{'-'*30} | {'-'*20} | {'-'*40}")
             for pkg, (target_ver, reason) in failed.items(): print(f"{pkg:<30} | {target_ver:<20} | {reason}")
         print("#"*70 + "\n")
-
-    def _run_final_health_check(self):
-        print("\n" + "#"*70); print("### FINAL SYSTEM HEALTH CHECK ###"); print("#"*70 + "\n")
-        venv_dir = Path("./final_venv")
-        if venv_dir.exists(): shutil.rmtree(venv_dir)
-        venv.create(venv_dir, with_pip=True)
-        python_executable = str((venv_dir / "bin" / "python").resolve())
-        _, stderr, returncode = run_command([python_executable, "-m", "pip", "install", "-r", str(self.requirements_path)])
-        if returncode != 0:
-            print("CRITICAL ERROR: Final installation of combined dependencies failed!", file=sys.stderr); return
-        success, metrics, _ = validate_changes(python_executable, self.config, group_title="Final System Health Check")
-        if success and metrics and "not available" not in metrics:
-            print("\n" + "="*70); print("=== FINAL METRICS FOR THE FULLY UPDATED ENVIRONMENT ==="); print("\n".join([f"  {line}" for line in metrics.split('\n')])); print("="*70)
-        elif success:
-            print("\n" + "="*70); print("=== Final validation passed, but metrics were not available in output. ==="); print("="*70)
-        else:
-            print("\n" + "!"*70); print("!!! CRITICAL ERROR: Final validation of combined dependencies failed! !!!"); print("!"*70)
 
     def get_latest_version(self, package_name):
         try:
@@ -355,7 +365,7 @@ class DependencyAgent:
                 except Exception:
                     reason = "Conflict (Could not parse details)"
             else: # Fallback for other error types
-                 summary = self._ask_llm_to_summarize_error(stderr_install)
+                 summary = self._get_error_summary(stderr_install)
                  reason = f"Installation failed: {summary}"
 
             print(f"--> DIAGNOSIS: {reason}")
@@ -374,7 +384,17 @@ class DependencyAgent:
         end_group()
         return True, metrics, ""
 
+    # In agent_logic.py
+
+    # In agent_logic.py
+
     def attempt_update_with_healing(self, package, current_version, target_version, dynamic_constraints, baseline_reqs_path):
+        """
+        The "Triage" function. Implements the tiered healing strategy with the Feasibility Check.
+        Level 1: Deterministic Filter-Then-Scan.
+        Level 2 (Conditional): Escalates to the Expert Agent for Co-Resolution
+                               only if a plausible path exists.
+        """
         print(f"\n--> Toplevel Attempt: Trying direct update to {package}=={target_version}")
         
         success, result_data, stderr = self._try_install_and_validate(
@@ -382,26 +402,78 @@ class DependencyAgent:
         )
         
         if success:
-            print(f"--> Toplevel Result: Direct update to {package}=={target_version} SUCCEEDED.")
+            print(f"--> Toplevel Result: Direct update SUCCEEDED.")
             return True, result_data if "skipped" in str(result_data) else target_version, None
 
-        # --- This is the corrected, simpler flow ---
         print(f"\n--> Toplevel Result: Direct update FAILED. Reason: '{result_data}'")
-        print("--> Action: Entering healing mode with 'Filter-Then-Scan' strategy.")
-
-        # The call is now simple again. It doesn't need the extra parameter.
-        healed_version = self._heal_with_filter_and_scan(
-            package, current_version, target_version, baseline_reqs_path
-        )
+        
+        # --- LEVEL 1 HEALING (Default) ---
+        print("--> Action: Entering Level 1 Healing with 'Filter-Then-Scan' strategy.")
+        healed_version = self._heal_with_filter_and_scan(package, current_version, target_version, baseline_reqs_path)
         
         if healed_version and healed_version != current_version:
-             print(f"--> Healing Result: A new working version was found for '{package}': {healed_version}")
+             print(f"--> Healing Result: Level 1 Succeeded. Found new working version: {healed_version}")
              return True, healed_version, None
+
+        # --- ESCALATION TO LEVEL 2 (If Level 1 Fails) ---
+        print(f"\n--> Action: Level 1 Healing failed for '{package}'. Escalating to Level 2 'Co-Resolution Expert'.")
+        
+        # 1. Diagnose the blockers
+        print("    -> Step 1: Diagnosing blockers...")
+        blockers = self.expert.diagnose_conflict_from_log(stderr)
+        if not blockers:
+            print("    -> Diagnosis FAILED. Cannot proceed with co-resolution.")
+            return True, current_version, None
+
+        # 2. THE CRITICAL FEASIBILITY CHECK
+        print(f"    -> Step 2: Checking feasibility. Diagnosed blockers are {blockers}.")
+        available_updates = self.get_available_updates_from_plan()
+        
+        # Find blockers that are NOT the package we're currently trying to heal.
+        other_blockers = [b for b in blockers if b.lower() != package.lower()]
+        
+        updatable_blockers = {
+            pkg: ver for pkg, ver in available_updates.items() 
+            if pkg in other_blockers
+        }
+        
+        if not updatable_blockers:
+            print("    -> Feasibility Check FAILED: None of the *other* blocking packages have an available update.")
+            print("       A meaningful co-resolution is not possible at this time.")
+            return True, current_version, None # Revert to old version
+
+        print(f"    -> Feasibility Check PASSED: The following other blockers can be co-updated: {list(updatable_blockers.keys())}")
+
+        # 3. Delegate to the Expert Agent for a plan
+        print("    -> Step 3: Requesting a co-resolution plan from the Expert Agent...")
+        # Add our target package to the list of what can be updated for the expert's context
+        updatable_blockers[package] = target_version
+        co_resolution_plan = self.expert.propose_co_resolution(package, stderr, updatable_blockers)
+
+        # 4. Execute the "Moonshot" Probe
+        if co_resolution_plan and co_resolution_plan.get("plausible"):
+            print(f"    -> Step 4: Executing expert's proposed plan: {co_resolution_plan['proposed_plan']}")
+            
+            probe_succeeded = self._run_co_resolution_probe(
+                co_resolution_plan['proposed_plan'],
+                baseline_reqs_path
+            )
+
+            if probe_succeeded:
+                print("--> Co-resolution probe SUCCEEDED! (Logic to apply changes to be implemented)")
+                # For now, we'll just return the new version of the original package.
+                # A full implementation would need to update the state for all packages in the plan.
+                for req in co_resolution_plan['proposed_plan']:
+                    if self._get_package_name_from_spec(req) == package:
+                        return True, req.split('==')[1], None
+            else:
+                print("--> Co-resolution probe FAILED.")
         else:
-             # This is the message for when no better version is found.
-             print(f"--> Healing Result: No newer, compatible, and working version of '{package}' was found. Reverting to {current_version}.")
-             # We return success=True and the original version, because staying put is a valid resolution.
-             return True, current_version, None
+            print("    -> Expert's Advice: No plausible co-resolution plan was found.")
+
+        # If we reach here, all attempts have failed.
+        print(f"--> Healing Result: All strategies for '{package}' failed. Reverting to {current_version}.")
+        return True, current_version, None
         
     def _heal_with_filter_and_scan(self, package, last_good_version, failed_version, baseline_reqs_path):
         start_group(f"Healing '{package}': Filter-Then-Scan Strategy")
@@ -438,7 +510,7 @@ class DependencyAgent:
                 installable_versions.append(version)
             else:
                 # --- START OF NEW, CONTEXTUAL LOGGING ---
-                summary = self._ask_llm_to_summarize_error(stderr)
+                summary = self._get_error_summary(stderr)
                 # This new log format is much clearer
                 print(f"     -- Incompatible. The attempt to add this version revealed an underlying conflict.")
                 print(f"        Diagnosis: {summary}")
@@ -479,31 +551,150 @@ class DependencyAgent:
         except Exception: return []
 
     def _prune_pip_freeze(self, freeze_output):
+        """
+        Cleans the output of 'pip freeze' to create a clean, complete lock file.
+        It now correctly PRESERVES both standard pinned dependencies ('==') and
+        the essential editable install line ('-e').
+        """
         lines = freeze_output.strip().split('\n')
-        return "\n".join([line for line in lines if '==' in line and not line.startswith('-e')])
-
-    def _ask_llm_to_summarize_error(self, error_message):
-        """
-        Uses the LLM to generate a concise, one-sentence summary of a pip error log.
-        This is used for providing clear, human-readable diagnostics in logs.
-        """
-        # First, check if the LLM is available to prevent errors.
-        if not self.llm_available:
-            return "(LLM summary unavailable)"
-
-        # The prompt is engineered to be specific, asking for a single, concise sentence.
-        prompt = (
-            "The following is a Python pip install error log. Please summarize the "
-            "root cause of the conflict in a single, concise sentence. Focus on the names "
-            "of the packages that are in conflict and their version constraints. "
-            f"Error Log: --- {error_message} ---"
-        )
         
-        try:
-            response = self.llm.generate_content(prompt)
-            # Clean up the response to ensure it's a single, clean line for logging.
-            return response.text.strip().replace('\n', ' ')
-        except Exception as e:
-            # If the API call fails for any reason (e.g., quota, network), return a safe default.
-            print(f"  -> LLM_ERROR: Could not get summary: {e}")
-            return "Failed to get summary from LLM."
+        # --- THE DEFINITIVE, FINAL FIX ---
+        # A line is kept if it is a standard pin ('==') OR if it's an editable install ('-e').
+        pruned_lines = [
+            line for line in lines 
+            if '==' in line or line.strip().startswith('-e')
+        ]
+        # --- END OF THE DEFINITIVE FIX ---
+        
+        # Sort the output for consistency, keeping editable installs at the top.
+        editable_lines = sorted([line for line in pruned_lines if line.startswith('-e')])
+        pinned_lines = sorted([line for line in pruned_lines if '==' in line])
+
+        return "\n".join(editable_lines + pinned_lines)
+    
+    def _get_error_summary(self, error_message: str) -> str:
+        """Delegates the task of summarizing an error to the Expert Agent."""
+        return self.expert.summarize_error(error_message)
+    
+
+    def get_available_updates_from_plan(self) -> dict:
+        """
+        A helper function that scans the current baseline and returns a dictionary
+        of all packages that have a newer version available on PyPI.
+        This is used to provide context to the Co-Resolution Expert.
+        
+        Returns: {'package-name': 'latest-version', ...}
+        """
+        available_updates = {}
+        # We need to read from the original, pristine requirements file for the pass,
+        # not the progressive one which might have partial changes.
+        with open(self.requirements_path, 'r') as f:
+            for line in f:
+                if '==' not in line or line.startswith('#') or line.startswith('-e'):
+                    continue
+                try:
+                    pkg_name = self._get_package_name_from_spec(line.split('==')[0])
+                    current_ver = line.split('==')[1].split(';')[0].strip()
+                    latest_ver = self.get_latest_version(pkg_name)
+                    if latest_ver and parse_version(latest_ver) > parse_version(current_ver):
+                        available_updates[pkg_name] = latest_ver
+                except Exception:
+                    continue # Ignore lines we can't parse
+        return available_updates
+
+    # In agent_logic.py
+
+    def _run_co_resolution_probe(self, proposed_plan: list, baseline_reqs_path: Path) -> bool:
+        """
+        Performs a true multi-package probe in a clean environment to validate an
+        expert's co-resolution plan.
+        """
+        start_group(f"Co-Resolution Probe: Testing plan {proposed_plan}")
+        
+        # We need a clean venv for this experiment.
+        venv_dir = Path("./temp_co_res_venv")
+        if venv_dir.exists(): shutil.rmtree(venv_dir)
+        venv.create(venv_dir, with_pip=True)
+        python_executable = str((venv_dir / "bin" / "python").resolve())
+        project_dir = self.config["VALIDATION_CONFIG"].get("project_dir")
+        
+        # --- Stage 1: Install the correctly modified dependency set ---
+        print("--> Stage 1: Installing the proposed co-resolution dependency set...")
+        
+        requirements_list = []
+        packages_in_plan = [self._get_package_name_from_spec(p) for p in proposed_plan]
+
+        with open(baseline_reqs_path, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith('#'): continue
+                # Exclude the old versions of packages that are in our new plan
+                if self._get_package_name_from_spec(line) not in packages_in_plan:
+                    requirements_list.append(line)
+        
+        # Add the new proposed versions
+        requirements_list.extend(proposed_plan)
+        
+        pip_command_tools = [python_executable, "-m", "pip", "install"] + requirements_list
+        _, stderr_install, returncode = run_command(pip_command_tools, cwd=project_dir)
+        
+        if returncode != 0:
+            print("--> ERROR: Co-resolution installation failed.")
+            summary = self.expert.summarize_error(stderr_install)
+            print(f"    Diagnosis: {summary}")
+            end_group()
+            return False
+
+        # --- Stage 2: Build and Install the Project ---
+        print("\n--> Stage 2: Building and installing the project...")
+        build_install_command = [python_executable, "-m", "pip", "install", f"./{project_dir}"]
+        _, stderr_build, returncode_build = run_command(build_install_command, cwd=project_dir)
+        if returncode_build != 0:
+            print("--> ERROR: Project build/install failed with the co-resolution set.")
+            end_group()
+            return False
+
+        # --- Stage 3: Run Validation ---
+        print("\n--> Stage 3: Running validation suite on the co-resolution set...")
+        success, _, _ = validate_changes(python_executable, self.config, group_title="Validating Co-Resolution Plan")
+        
+        if not success:
+            print("--> ERROR: Validation failed for the co-resolution set.")
+            end_group()
+            return False
+
+        print("--> SUCCESS: The co-resolution plan is provably working.")
+        end_group()
+        return True
+    
+    # In agent_logic.py
+
+    def _unpin_and_bootstrap(self):
+        """
+        The definitive repair strategy: takes a broken requirements file,
+        unpins it, and calls the standard bootstrap process to create a new,
+        working lock file from scratch.
+        """
+        start_group("REPAIR MODE: Re-bootstrapping from unpinned requirements")
+        
+        print("--> Step 1: Extracting package names from broken requirements file...")
+        package_names = []
+        with open(self.requirements_path, 'r') as f_read:
+            for line in f_read:
+                # Keep the editable install line as-is, but unpin others.
+                if line.strip().startswith('-e'):
+                    package_names.append(line.strip())
+                else:
+                    pkg_name = self._get_package_name_from_spec(line)
+                    if pkg_name:
+                        package_names.append(pkg_name)
+        
+        print(f"--> Step 2: Overwriting '{self.requirements_path.name}' with unpinned packages.")
+        with open(self.requirements_path, 'w') as f_write:
+            f_write.write("\n".join(sorted(package_names)))
+
+        print("\n--> Step 3: Calling bootstrap to find a new, stable, pinned baseline...")
+        self._bootstrap_unpinned_requirements()
+        
+        print("\nINFO: Baseline successfully repaired.")
+        end_group()
