@@ -17,6 +17,7 @@ AGENT_CONFIG = {
     "REQUIREMENTS_FILE": "requirements.txt",
     
     "METRICS_OUTPUT_FILE": "metrics_output.txt",
+    "PRIMARY_REQUIREMENTS_FILE": "primary_requirements.txt",
 
     # This configuration tells our universal agent_utils.py how to validate this specific project.
     "VALIDATION_CONFIG": {
