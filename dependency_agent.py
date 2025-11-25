@@ -12,6 +12,7 @@ from expert_agent import ExpertAgent
 AGENT_CONFIG = {
     # A unique name for the project.
     "PROJECT_NAME": "graphite",
+    "IS_INSTALLABLE_PACKAGE": True, 
 
     # This is the "Golden Record" lock file that the agent will manage.
     "REQUIREMENTS_FILE": "requirements.txt",
