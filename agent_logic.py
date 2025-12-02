@@ -94,9 +94,18 @@ class DependencyAgent:
         is_fully_pinned = all('==' in line or line.startswith('-e') for line in lines)
         return is_fully_pinned, lines
 
-    def _bootstrap_unpinned_requirements(self):
+    def _bootstrap_unpinned_requirements(self, is_fallback_attempt=False):
+        """
+        Attempts to install the requirements. 
+        If is_fallback_attempt is True, we fail hard on error.
+        If False, we try to unpin and retry on error.
+        """
         start_group("BOOTSTRAP: Establishing a Stable Baseline")
-        print("Unpinned requirements detected. Creating and validating a stable baseline...")
+        if is_fallback_attempt:
+            print("RETRY MODE: Attempting bootstrap with ALL version constraints removed...")
+        else:
+            print("Unpinned requirements detected. Creating and validating a stable baseline...")
+            
         venv_dir = Path("./bootstrap_venv")
         if venv_dir.exists(): shutil.rmtree(venv_dir)
         venv.create(venv_dir, with_pip=True)
@@ -113,9 +122,17 @@ class DependencyAgent:
             end_group()
             return
 
-        print("\nCRITICAL: Initial baseline failed validation. Cannot proceed.", file=sys.stderr)
-        start_group("View Initial Baseline Failure Log"); print(error_log); end_group()
-        sys.exit("CRITICAL ERROR: Bootstrap failed. Please provide a working set of requirements.")
+        # --- FAILURE HANDLING ---
+        print("\nWARNING: Bootstrap attempt failed.", file=sys.stderr)
+        
+        if not is_fallback_attempt:
+            print("Action: Baseline broken. Activating 'Unpin and Bootstrap' repair strategy to find ANY working configuration.")
+            end_group() # Close the current log group
+            self._unpin_and_bootstrap()
+        else:
+            print("CRITICAL: Even the unpinned/relaxed requirements failed to install.", file=sys.stderr)
+            start_group("View Failure Log"); print(error_log); end_group()
+            sys.exit("CRITICAL ERROR: Unable to establish a working baseline. Please check your requirements or Python version.")
     
     def run(self):
         if os.path.exists(self.config["METRICS_OUTPUT_FILE"]):
@@ -125,7 +142,7 @@ class DependencyAgent:
 
         if not is_pinned:
             print("INFO: Unpinned requirements detected. Bootstrapping a new baseline...")
-            self._bootstrap_unpinned_requirements()
+            self._bootstrap_unpinned_requirements(is_fallback_attempt=False)
         else:
             print("INFO: Found pinned requirements. Running initial health check and regenerating lockfile...")
             start_group("Initial Baseline Health Check")
@@ -644,11 +661,17 @@ class DependencyAgent:
         return True
     
     def _unpin_and_bootstrap(self):
-        start_group("REPAIR MODE: Re-bootstrapping from unpinned requirements")
+        """
+        The definitive repair strategy: takes a broken requirements file,
+        unpins it, and calls bootstrap in 'Fallback Mode'.
+        """
+        start_group("REPAIR MODE: stripping all version constraints")
+        
         print("--> Step 1: Extracting package names from broken requirements file...")
         package_names = []
         with open(self.requirements_path, 'r') as f_read:
             for line in f_read:
+                # Keep the editable install line as-is
                 if line.strip().startswith('-e'):
                     package_names.append(line.strip())
                 else:
@@ -659,7 +682,9 @@ class DependencyAgent:
         print(f"--> Step 2: Overwriting '{self.requirements_path.name}' with unpinned packages.")
         with open(self.requirements_path, 'w') as f_write:
             f_write.write("\n".join(sorted(package_names)))
-        print("\n--> Step 3: Calling bootstrap to find a new, stable, pinned baseline...")
-        self._bootstrap_unpinned_requirements()
-        print("\nINFO: Baseline successfully repaired.")
+
+        print("\n--> Step 3: Retrying bootstrap with clean slate...")
         end_group()
+        
+        # Pass True so we don't loop forever if this fails
+        self._bootstrap_unpinned_requirements(is_fallback_attempt=True)
