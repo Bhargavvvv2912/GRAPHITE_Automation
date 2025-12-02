@@ -32,28 +32,20 @@ jobs:
 
       - name: Force Install Latest Agent Dependencies
         run: |
-          # 1. THE NUKE: This is the critical step.
           python -m pip uninstall -y google-generativeai
-          
-          # 2. THE PAVE: Now, pip has no choice.
-          python -m pip install google-generativeai pypi-simple packaging
+          python -m pip install google-generativeai pypi-simple packaging pip-tools
 
       - name: Run the Autonomous Agent
         run: python dependency_agent.py
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
 
-      # --- ADD THIS NEW STEP ---
-      - name: Configure git to ignore temporary directories
+      # --- FIXED: Cleanup Step ---
+      # We remove the specific temp folders created by agent_logic.py
+      # so they don't clutter the git status.
+      - name: Cleanup Agent Artifacts
         run: |
-          echo "Configuring git to ignore agent artifacts for this run..."
-          # Create a git exclude file for this run
-          echo "/temp_venv/" >> .git/info/exclude
-          echo "/final_venv/" >> .git/info/exclude
-          echo "/bootstrap_venv/" >> .git/info/exclude
-          echo "/temp_pip_check/" >> .git/info/exclude
-          echo "/requests/" >> .git/info/exclude
-      # --- END OF NEW STEP ---
+          rm -rf temp_venv final_venv bootstrap_venv temp_pip_check initial_check_venv temp_co_res_venv
       
       - name: Commit and push changes if any
         run: |
@@ -62,27 +54,26 @@ jobs:
           
           TARGET_FILE="requirements.txt"
           
-          # First, ensure the git index is up-to-date with what's on disk.
+          # 1. Force add the requirements file
           git add $TARGET_FILE
           
-          # Now, compare the staged changes (what's on disk) with the latest commit.
-          # If there are no staged changes, this command will be quiet.
-          if git diff-index --quiet HEAD; then
-            echo "No dependency changes to commit."
+          # 2. ROBUST CHECK: Check if the 'add' command actually staged anything.
+          # --staged checks the index against HEAD. 
+          # --quiet returns 0 if they match (no changes), 1 if they differ (changes).
+          if git diff --staged --quiet; then
+            echo "No changes detected in requirements.txt. Skipping commit."
             exit 0
           fi
           
           echo "Dependencies have changed. Committing and pushing..."
           
-          COMMIT_BODY="Automated dependency updates for the Requests library."
+          COMMIT_BODY="Automated dependency updates via AURA."
           if [ -f metrics_output.txt ]; then
             COMMIT_BODY=$(cat metrics_output.txt)
           fi
           
-          # The file is already added, we just need to commit.
-          git commit -m "chore(deps): Autonomously manage requests dependencies [skip ci]" -m "$COMMIT_BODY"
+          # 3. Commit only the staged file (requirements.txt)
+          # This ignores the modified __pycache__ files shown in your logs.
+          git commit -m "chore(deps): Autonomously manage dependencies [skip ci]" -m "$COMMIT_BODY"
           
           git push
-
-  
-  
