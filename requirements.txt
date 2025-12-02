@@ -6,9 +6,5 @@ scipy==1.10.1
 kornia
 Pillow
 matplotlib
-prettytable
-opencv-python
 pandas
-joblib
 tqdm
-python-Levenshtein
