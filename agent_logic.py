@@ -97,8 +97,7 @@ class DependencyAgent:
     def _bootstrap_unpinned_requirements(self, is_fallback_attempt=False):
         """
         Attempts to install the requirements. 
-        If is_fallback_attempt is True, we fail hard on error.
-        If False, we try to unpin and retry on error.
+        If is_fallback_attempt is True, we fail hard on error to prevent infinite loops.
         """
         start_group("BOOTSTRAP: Establishing a Stable Baseline")
         if is_fallback_attempt:
@@ -126,13 +125,15 @@ class DependencyAgent:
         print("\nWARNING: Bootstrap attempt failed.", file=sys.stderr)
         
         if not is_fallback_attempt:
-            print("Action: Baseline broken. Activating 'Unpin and Bootstrap' repair strategy to find ANY working configuration.")
-            end_group() # Close the current log group
+            print("Action: Baseline broken. Activating 'Unpin and Bootstrap' repair strategy.")
+            end_group() # Close the log group properly
             self._unpin_and_bootstrap()
         else:
+            # THIS IS THE SAFETY NET THAT PREVENTS INFINITE LOOPS
             print("CRITICAL: Even the unpinned/relaxed requirements failed to install.", file=sys.stderr)
             start_group("View Failure Log"); print(error_log); end_group()
             sys.exit("CRITICAL ERROR: Unable to establish a working baseline. Please check your requirements or Python version.")
+
     
     def run(self):
         if os.path.exists(self.config["METRICS_OUTPUT_FILE"]):
@@ -686,5 +687,5 @@ class DependencyAgent:
         print("\n--> Step 3: Retrying bootstrap with clean slate...")
         end_group()
         
-        # Pass True so we don't loop forever if this fails
+        # Call with is_fallback_attempt=True to enforce the 1-try limit
         self._bootstrap_unpinned_requirements(is_fallback_attempt=True)
