@@ -23,8 +23,6 @@ class ExpertAgent:
         Example output: ['langchain-core<0.2', 'langchain==0.1.0']
         """
         constraints = []
-        # Pattern: Package name followed by version operator and version number
-        # Captures the whole string like "numpy<2.0" or "pandas==1.5.3"
         pattern = re.compile(r"([a-zA-Z0-9\-_]+(?:==|>=|<=|~=|!=|<|>)[0-9\.]+)")
         
         for match in pattern.finditer(error_log):
@@ -125,8 +123,6 @@ class ExpertAgent:
             history_text = "--- PREVIOUS FAILED ATTEMPTS ---\n"
             for i, (attempt_plan, failure_reason) in enumerate(history):
                 history_text += f"Attempt {i+1} Plan: {attempt_plan}\nResult: FAILED. Reason: {failure_reason}\n\n"
-
-        # --- THE UPGRADED "CHAIN OF THOUGHT" PROMPT ---
         prompt = f"""
         You are CORE (Constraint Optimization & Resolution Expert).
         You are solving a hard dependency deadlock for '{target_package}'.
