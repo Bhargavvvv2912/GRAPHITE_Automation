@@ -51,7 +51,7 @@ jobs:
           
           # 4. Run the Validation Script (Record if this crashes)
           echo "--> Attempting: Running Validation Script"
-          python validation_cyclegan.py  # <--- MAKE SURE THIS MATCHES YOUR SCRIPT NAME
+          python validation_graphite.py  
           
           echo "========================================"
           echo "RESULT: PIP BASELINE PASSED"

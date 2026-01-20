@@ -1,47 +1,53 @@
-# dependency_agent.py (The Final, Correctly Configured Version for GRAPHITE)
+# dependency_agent.py (CycleGAN - Updated for Google Gen AI SDK v1.0)
 
 import os
 import sys
-import google.generativeai as genai
+# We import the NEW Google library
+from google import genai
 
-# Import the two agents that form our final architecture
 from agent_logic import DependencyAgent
-from expert_agent import ExpertAgent
 
-# --- This is the definitive, simplified, and correct configuration for the GRAPHITE project ---
+# --- THE WRAPPER (Translation Layer) ---
+# This class makes the NEW Google Client look like the OLD Model
+# so your ExpertAgent code doesn't crash.
+class GeminiClientWrapper:
+    def __init__(self, api_key, model_name):
+        self.client = genai.Client(api_key=api_key)
+        self.model_name = model_name
+
+    def generate_content(self, prompt):
+        # Translate the call to the new SDK format
+        response = self.client.models.generate_content(
+            model=self.model_name,
+            contents=prompt
+        )
+        return response
+
 AGENT_CONFIG = {
-    # A unique name for the project.
-    "PROJECT_NAME": "graphite",
+    "PROJECT_NAME": "cyclegan",
     "IS_INSTALLABLE_PACKAGE": False, 
-
-    # This is the "Golden Record" lock file that the agent will manage.
     "REQUIREMENTS_FILE": "requirements.txt",
-    
     "METRICS_OUTPUT_FILE": "metrics_output.txt",
     "PRIMARY_REQUIREMENTS_FILE": "primary_requirements.txt",
-
-    # This configuration tells our universal agent_utils.py how to validate this specific project.
     "VALIDATION_CONFIG": {
         "type": "script",
-        # It correctly points to our dedicated validation script for this project.
-        "smoke_test_script": "validation_graphite.py",
+        "smoke_test_script": "validation_cyclegan.py",
+        "project_dir": "." 
     },
-    
-    # All other standard settings
     "MAX_RUN_PASSES": 3,
 }
 
 if __name__ == "__main__":
-    # --- This is the standard, reusable loader logic for our multi-agent system ---
-    
     GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
     if not GEMINI_API_KEY:
         sys.exit("CRITICAL ERROR: GEMINI_API_KEY environment variable not set.")
     
-    genai.configure(api_key=GEMINI_API_KEY)
-    llm_client = genai.GenerativeModel('gemini-2.5-flash')
+    # We use the Wrapper here instead of the old 'genai.GenerativeModel'
+    # We use 'gemini-2.0-flash' which is standard for the new SDK.
+    llm_client = GeminiClientWrapper(
+        api_key=GEMINI_API_KEY, 
+        model_name='gemini-2.5-flash'
+    )
 
-    # Initialize the Manager (AURA) by passing it the config and the LLM client.
-    # The agent's __init__ method will handle creating its own Expert assistant.
     agent = DependencyAgent(config=AGENT_CONFIG, llm_client=llm_client)
     agent.run()

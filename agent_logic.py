@@ -95,10 +95,6 @@ class DependencyAgent:
         return is_fully_pinned, lines
 
     def _bootstrap_unpinned_requirements(self, is_fallback_attempt=False):
-        """
-        Attempts to install the requirements. 
-        If is_fallback_attempt is True, we fail hard on error to prevent infinite loops.
-        """
         start_group("BOOTSTRAP: Establishing a Stable Baseline")
         if is_fallback_attempt:
             print("RETRY MODE: Attempting bootstrap with ALL version constraints removed...")
@@ -121,19 +117,38 @@ class DependencyAgent:
             end_group()
             return
 
-        # --- FAILURE HANDLING ---
         print("\nWARNING: Bootstrap attempt failed.", file=sys.stderr)
         
         if not is_fallback_attempt:
             print("Action: Baseline broken. Activating 'Unpin and Bootstrap' repair strategy.")
-            end_group() # Close the log group properly
+            end_group()
             self._unpin_and_bootstrap()
         else:
-            # THIS IS THE SAFETY NET THAT PREVENTS INFINITE LOOPS
             print("CRITICAL: Even the unpinned/relaxed requirements failed to install.", file=sys.stderr)
             start_group("View Failure Log"); print(error_log); end_group()
             sys.exit("CRITICAL ERROR: Unable to establish a working baseline. Please check your requirements or Python version.")
 
+    def _unpin_and_bootstrap(self):
+        start_group("REPAIR MODE: stripping all version constraints")
+        print("--> Step 1: Extracting package names from broken requirements file...")
+        package_names = []
+        with open(self.requirements_path, 'r') as f_read:
+            for line in f_read:
+                if line.strip().startswith('-e'):
+                    package_names.append(line.strip())
+                else:
+                    pkg_name = self._get_package_name_from_spec(line)
+                    if pkg_name:
+                        package_names.append(pkg_name)
+        
+        print(f"--> Step 2: Overwriting '{self.requirements_path.name}' with unpinned packages.")
+        with open(self.requirements_path, 'w') as f_write:
+            f_write.write("\n".join(sorted(package_names)))
+
+        print("\n--> Step 3: Retrying bootstrap with clean slate...")
+        end_group()
+        
+        self._bootstrap_unpinned_requirements(is_fallback_attempt=True)
     
     def run(self):
         if os.path.exists(self.config["METRICS_OUTPUT_FILE"]):
@@ -177,13 +192,21 @@ class DependencyAgent:
             
             progressive_baseline_path = Path(f"./pass_{pass_num}_progressive_reqs.txt")
             shutil.copy(self.requirements_path, progressive_baseline_path)
+            
             changed_packages_this_pass = set()
+            processed_in_this_pass = set()
+
+            # Map Current Versions for No-Op Detection
+            current_pass_versions = {}
+            with open(progressive_baseline_path, 'r') as f:
+                for line in f:
+                    if '==' in line and not line.strip().startswith('#'):
+                        pkg = self._get_package_name_from_spec(line.split('==')[0])
+                        ver = line.split('==')[1].split(';')[0].strip()
+                        current_pass_versions[pkg] = ver
 
             packages_to_update = []
-            with open(progressive_baseline_path, 'r') as f: lines = [line.strip() for line in f if line.strip() and not line.strip().startswith('#')]
-            for line in lines:
-                if '==' not in line or line.strip().startswith('-e'): continue
-                package, current_version = self._get_package_name_from_spec(line.split('==')[0]), line.split('==')[1].split(';')[0]
+            for package, current_version in current_pass_versions.items():
                 latest_version = self.get_latest_version(package)
                 if latest_version and parse_version(latest_version) > parse_version(current_version):
                     packages_to_update.append((package, current_version, latest_version))
@@ -197,6 +220,7 @@ class DependencyAgent:
             for pkg, cur, target in packages_to_update:
                 components = self._calculate_update_risk_components(pkg, cur, target)
                 update_plan.append({'pkg': pkg, 'cur': cur, 'target': target, 'components': components})
+            
             max_ecosystem = max(p['components']['ecosystem'] for p in update_plan) if update_plan else 0
             max_depth = max(p['components']['depth'] for p in update_plan) if update_plan else 0
             W_ECOSYSTEM, W_DEPTH = 1.0, 0.5
@@ -221,29 +245,47 @@ class DependencyAgent:
             
             for i, p_data in enumerate(update_plan):
                 package, current_ver, target_ver = p_data['pkg'], p_data['cur'], p_data['target']
+                
+                if package in processed_in_this_pass:
+                    print(f"\nSkipping '{package}' (Already processed in this pass).")
+                    continue
+
                 print(f"\n" + "-"*80); print(f"PULSE: [PASS {pass_num} | ATTEMPT {i+1}/{len(update_plan)}] Processing '{package}'"); print(f"PULSE: Changed packages this pass so far: {changed_packages_this_pass}"); print("-"*80)
                 
-                success, reason_or_new_version, _ = self.attempt_update_with_healing(package, current_ver, target_ver, [], progressive_baseline_path, progressive_baseline_path)
+                success, changes_dict, _ = self.attempt_update_with_healing(package, current_ver, target_ver, [], progressive_baseline_path, progressive_baseline_path)
                 
                 if success:
-                    reached_version, is_a_real_change = "", False
-                    if "skipped" in str(reason_or_new_version): reached_version, is_a_real_change = current_ver, False
-                    else:
-                        reached_version = reason_or_new_version
-                        if current_ver != reached_version: is_a_real_change = True
-                    final_successful_updates[package] = (target_ver, reached_version)
-                    if is_a_real_change:
-                        changed_packages_this_pass.add(package)
-                        print(f"  -> SUCCESS. Locking in {package}=={reached_version} into the progressive baseline for this pass.")
-                        with open(progressive_baseline_path, "r") as f: temp_lines = f.readlines()
+                    real_changes_to_write = {}
+                    
+                    for changed_pkg, reached_ver in changes_dict.items():
+                        processed_in_this_pass.add(changed_pkg)
+                        old_ver = current_pass_versions.get(changed_pkg, "0.0.0")
+                        
+                        if reached_ver == old_ver or "skipped" in str(reached_ver):
+                            print(f"  -> Result for {changed_pkg}: Reverted/Kept at {reached_ver} (No Change).")
+                        else:
+                            final_successful_updates[changed_pkg] = (old_ver, reached_ver)
+                            changed_packages_this_pass.add(changed_pkg)
+                            real_changes_to_write[changed_pkg] = reached_ver
+                            
+                            if changed_pkg == package:
+                                print(f"  -> SUCCESS. Locking in {changed_pkg}=={reached_ver}")
+                            else:
+                                print(f"  -> Co-Resolution Side-Effect: Locked in {changed_pkg}=={reached_ver}")
+                    
+                    # Persist changes to file
+                    if real_changes_to_write:
+                        with open(progressive_baseline_path, "r") as f: lines = f.readlines()
                         with open(progressive_baseline_path, "w") as f:
-                            for line in temp_lines:
-                                if self._get_package_name_from_spec(line.split(';')[0]) == package:
-                                    marker_part = f" ;{line.split(';')[1]}" if ';' in line else ""
-                                    f.write(f"{package}=={reached_version}{marker_part}\n")
-                                else: f.write(line)
+                            for line in lines:
+                                p_name = self._get_package_name_from_spec(line.split('==')[0] if '==' in line else "")
+                                if p_name in real_changes_to_write:
+                                    f.write(f"{p_name}=={real_changes_to_write[p_name]}\n")
+                                else:
+                                    f.write(line)
+
                 else:
-                    final_failed_updates[package] = (target_ver, reason_or_new_version)
+                    final_failed_updates[package] = (target_ver, "Failed")
             
             end_group()
 
@@ -263,9 +305,9 @@ class DependencyAgent:
         print("\n" + "#"*70); print("### OVERALL UPDATE RUN SUMMARY ###")
         if successful:
             print("\n[SUCCESS] The following packages were successfully updated:")
-            print(f"{'Package':<30} | {'Target Version':<20} | {'Reached Version':<20}")
+            print(f"{'Package':<30} | {'Old Version':<20} | {'New Version':<20}")
             print(f"{'-'*30} | {'-'*20} | {'-'*20}")
-            for pkg, (target_ver, version) in successful.items(): print(f"{pkg:<30} | {target_ver:<20} | {version:<20}")
+            for pkg, (old_ver, new_ver) in successful.items(): print(f"{pkg:<30} | {old_ver:<20} | {new_ver:<20}")
         if failed:
             print("\n[FAILURE] Updates were attempted but FAILED for:")
             print(f"{'Package':<30} | {'Target Version':<20} | {'Reason for Failure'}")
@@ -284,20 +326,24 @@ class DependencyAgent:
     def _run_bootstrap_and_validate(self, venv_dir, requirements_source):
         python_executable = str((venv_dir / "bin" / "python").resolve())
         
-        # Step 1: Install all dependencies from the requirements file.
         print(f"--> Bootstrap Step 1: Installing dependencies from '{requirements_source.name}'...")
         req_path = str(requirements_source.resolve())
-        pip_command_deps = [python_executable, "-m", "pip", "install", "-r", req_path]
+        
+        pip_command_deps = [
+            python_executable, "-m", "pip", "install", 
+            "--no-build-isolation", 
+            "--no-cache-dir", 
+            "-r", req_path
+        ]
+        
         _, stderr_deps, returncode_deps = run_command(pip_command_deps)
         if returncode_deps != 0:
             return False, None, f"Failed to install dependencies: {stderr_deps}"
 
-        # Step 2: Install the project itself (if applicable).
         if self.config.get("IS_INSTALLABLE_PACKAGE", False):
             project_extras = self.config.get("PROJECT_EXTRAS", "")
             print(f"\n--> Bootstrap Step 2: Installing project from current directory ('.') in editable mode...")
             
-            # FIXED: Added --no-build-isolation for legacy setup.py compatibility
             pip_command_project = [python_executable, "-m", "pip", "install", "--no-build-isolation", "-e", f".{project_extras}"]
             
             _, stderr_project, returncode_project = run_command(pip_command_project)
@@ -321,7 +367,6 @@ class DependencyAgent:
         venv.create(venv_dir, with_pip=True)
         python_executable = str((venv_dir / "bin" / "python").resolve())
         
-        # Step 1: Install the proposed dependency set.
         print("--> Probe Step 1: Installing the proposed dependency set...")
         temp_reqs_path = venv_dir / "probe_requirements.txt"
         with open(baseline_reqs_path, "r") as f_read, open(temp_reqs_path, "w") as f_write:
@@ -336,19 +381,38 @@ class DependencyAgent:
                 else:
                     f_write.write(f"{line}\n")
 
-        # FIXED: Added --no-build-isolation to bypass build errors during dependency install
-        pip_command_core = [python_executable, "-m", "pip", "install", "--no-build-isolation", "-r", str(temp_reqs_path.resolve())]
+        pip_command_core = [
+            python_executable, "-m", "pip", "install", 
+            "--no-build-isolation", 
+            "--no-cache-dir", 
+            "-r", str(temp_reqs_path.resolve())
+        ]
         _, stderr_core, returncode_core = run_command(pip_command_core)
-        if returncode_core != 0:
-            summary = self._get_error_summary(stderr_core)
-            end_group()
-            return False, f"Dependency installation failed: {summary}", stderr_core
         
+        if returncode_core != 0:
+            # Log Enrichment
+            enriched_stderr = stderr_core
+            try:
+                if temp_reqs_path.exists():
+                    with open(temp_reqs_path, 'r') as f: req_lines = f.readlines()
+                    def replace_line_ref(match):
+                        try:
+                            line_num = int(match.group(1))
+                            if 1 <= line_num <= len(req_lines):
+                                return f"'{req_lines[line_num-1].strip()}' (line {line_num})"
+                        except: pass
+                        return match.group(0)
+                    enriched_stderr = re.sub(r'(?:line\s+|line\s+#)(\d+)', replace_line_ref, stderr_core, flags=re.IGNORECASE)
+            except: pass
+
+            summary = self._get_error_summary(enriched_stderr)
+            end_group()
+            return False, f"Dependency installation failed: {summary}", enriched_stderr
+
         if self.config.get("IS_INSTALLABLE_PACKAGE", False):
             project_extras = self.config.get("PROJECT_EXTRAS", "")
             print(f"\n--> Probe Step 2: Installing project from current directory ('.')...")
             
-            # FIXED: Added --no-build-isolation
             pip_command_project = [python_executable, "-m", "pip", "install", "--no-build-isolation", f".{project_extras}"]
             
             _, stderr_project, returncode_project = run_command(pip_command_project)
@@ -357,7 +421,6 @@ class DependencyAgent:
                 end_group()
                 return False, f"Project installation failed: {summary}", stderr_project
         
-        # Step 3: Run Validation.
         print("\n--> Probe Step 3: Running validation suite...")
         success, metrics, validation_output = validate_changes(python_executable, self.config)
         if not success:
@@ -377,83 +440,123 @@ class DependencyAgent:
         
         if success:
             print(f"--> Toplevel Result: Direct update SUCCEEDED.")
-            return True, result_data if "skipped" in str(result_data) else target_version, None
+            return True, {package: result_data if "skipped" in str(result_data) else target_version}, None
 
         print(f"\n--> Toplevel Result: Direct update FAILED. Reason: '{result_data}'")
         
+        quick_blockers = self.expert.diagnose_conflict_from_log(toplevel_stderr)
+        print(f"    Suspected Blockers (Regex): {quick_blockers}")
+
         # --- LEVEL 1 HEALING ---
         print("--> Action: Entering Level 1 Healing with 'Filter-Then-Scan' strategy.")
-        
-        # UNPACK THE NEW RETURN VALUE (healed_ver, rich_log)
         healed_version, level1_stderr = self._heal_with_filter_and_scan(package, current_version, target_version, baseline_reqs_path)
         
         if healed_version and healed_version != current_version:
              print(f"--> Healing Result: Level 1 Succeeded. Found new working version: {healed_version}")
-             return True, healed_version, None
+             return True, {package: healed_version}, None
 
         # --- ESCALATION TO LEVEL 2 ---
-        print(f"\n--> Action: Level 1 Healing failed for '{package}'. Escalating to Level 2 'Co-Resolution Expert'.")
+        print(f"\n--> Action: Level 1 Healing failed for '{package}'. Escalating to Level 2 'Iterative Greedy Expansion'.")
         
-        # DECISION: Use the Level 1 log if available, as it contains specific conflict details
         best_error_log = level1_stderr if level1_stderr else toplevel_stderr
-
-        # 1. Diagnose the blockers
-        print("    -> Step 1: Diagnosing blockers...")
-        blockers = self.expert.diagnose_conflict_from_log(best_error_log)
+        current_blockers = set(self.expert.diagnose_conflict_from_log(best_error_log))
         
-        # 2. Feasibility Check
-        print(f"    -> Step 2: Checking feasibility. Diagnosed blockers: {blockers}")
-        available_updates = self.get_available_updates_from_plan()
-        
-        # Robust filtering: Ignore Target, Project Name, Pip, Setuptools
         project_name = self.config.get("PROJECT_NAME", "").lower().replace('_', '-')
-        other_blockers = [
-            b for b in blockers 
-            if b.lower() != package.lower() 
-            and b.lower() != project_name
-            and b.lower() != "pip"
-            and b.lower() != "setuptools"
-        ]
         
-        updatable_blockers = {
-            pkg: ver for pkg, ver in available_updates.items() 
-            if pkg in other_blockers
-        }
-        
-        if not updatable_blockers:
-            print("    -> Feasibility Check FAILED: No other blocking packages have available updates.")
-            print("       A meaningful co-resolution is not possible at this time.")
-            return True, current_version, None 
+        def filter_blockers(blocker_set):
+            return {
+                b.lower() 
+                for b in blocker_set 
+                if b.lower() != package.lower() 
+                and b.lower() != project_name
+                and b.lower() != "pip"
+                and b.lower() != "setuptools"
+            }
 
-        print(f"    -> Feasibility Check PASSED. Candidates: {list(updatable_blockers.keys())}")
-
-        # 3. GREEDY HEURISTIC ATTEMPT (Update ALL blockers)
-        print(f"    -> Step 3: Attempting 'Greedy Maximization' (Update ALL blockers to latest)...")
+        max_greedy_attempts = 5
+        greedy_history_log = [] 
+        attempted_plans = set()
         
-        greedy_plan = [f"{package}=={target_version}"]
-        for b_pkg, b_ver in updatable_blockers.items():
-            if b_pkg.lower() != package.lower():
-                greedy_plan.append(f"{b_pkg}=={b_ver}")
-        
-        print(f"       Greedy Plan: {greedy_plan}")
-        probe_success = self._run_co_resolution_probe(greedy_plan, baseline_reqs_path)
-        
-        if probe_success:
-            print("--> Greedy Maximization SUCCEEDED! (Skipped LLM)")
-            with open(progressive_baseline_path, "r") as f: temp_lines = f.readlines()
-            with open(progressive_baseline_path, "w") as f:
-                updated_pkgs = {self._get_package_name_from_spec(p.split('==')[0]): p.split('==')[1] for p in greedy_plan}
-                for line in temp_lines:
-                    p_name = self._get_package_name_from_spec(line.split('==')[0] if '==' in line else "")
-                    if p_name in updated_pkgs:
-                        f.write(f"{p_name}=={updated_pkgs[p_name]}\n")
-                    else:
-                        f.write(line)
-            return True, target_version, None
+        global_available_updates = self.get_available_updates_from_plan()
+        available_updates_map = {k.lower(): k for k in global_available_updates.keys()}
 
-        print("       Greedy Plan FAILED. Proceeding to Neuro-Symbolic Refinement.")
+        can_proceed_to_llm = False
 
-        # 4. NEURO-SYMBOLIC LOOP (Expert Agent)
+        for i in range(max_greedy_attempts):
+            print(f"\n    -> [Greedy Expansion Iteration {i+1}/{max_greedy_attempts}]")
+            
+            valid_blockers = filter_blockers(current_blockers)
+            
+            updatable_blockers = {}
+            for b in valid_blockers:
+                real_name = available_updates_map.get(b)
+                if real_name:
+                    updatable_blockers[real_name] = global_available_updates[real_name]
+            
+            print(f"       Current Conflict Cluster: {valid_blockers}")
+            print(f"       Updatable Candidates: {list(updatable_blockers.keys())}")
+            
+            if len(valid_blockers) > 0 and not updatable_blockers:
+                print("       CRITICAL: Blockers identified, but they are already at max version.")
+                print("       Aborting to prevent regression. Co-Resolution impossible.")
+                return True, {package: current_version}, None
+
+            if not updatable_blockers and i == 0:
+                print("       No updatable blockers found in initial set. Skipping Greedy.")
+                break
+            
+            can_proceed_to_llm = True
+
+            greedy_plan = [f"{package}=={target_version}"]
+            for b_pkg, b_ver in updatable_blockers.items():
+                if b_pkg.lower() != package.lower():
+                    greedy_plan.append(f"{b_pkg}=={b_ver}")
+            
+            plan_signature = tuple(sorted(greedy_plan))
+            if plan_signature in attempted_plans:
+                print("       CRITICAL: Detected logical cycle! Aborting Greedy Strategy.")
+                best_error_log = greedy_history_log[-1][1] if greedy_history_log else best_error_log
+                break
+            attempted_plans.add(plan_signature)
+            
+            print(f"       Testing Greedy Plan: {greedy_plan}")
+            
+            probe_success, probe_stderr = self._run_co_resolution_probe(greedy_plan, baseline_reqs_path)
+            
+            if probe_success:
+                print("--> Greedy Maximization SUCCEEDED!")
+                changes_map = {self._get_package_name_from_spec(p.split('==')[0]): p.split('==')[1] for p in greedy_plan}
+                
+                with open(progressive_baseline_path, "r") as f: temp_lines = f.readlines()
+                with open(progressive_baseline_path, "w") as f:
+                    for line in temp_lines:
+                        p_name = self._get_package_name_from_spec(line.split('==')[0] if '==' in line else "")
+                        if p_name in changes_map:
+                            f.write(f"{p_name}=={changes_map[p_name]}\n")
+                        else:
+                            f.write(line)
+                return True, changes_map, None
+            
+            greedy_history_log.append((str(greedy_plan), "Failed"))
+            
+            new_blockers = set(self.expert.diagnose_conflict_from_log(probe_stderr))
+            filtered_new = filter_blockers(new_blockers)
+            
+            if filtered_new.issubset(current_blockers):
+                print("       Result: Failure did not reveal new blockers. Greedy strategy stalled.")
+                best_error_log = probe_stderr
+                break
+            
+            print(f"       Result: Failure revealed new blockers: {filtered_new - current_blockers}")
+            current_blockers.update(filtered_new)
+
+        # 4. NEURO-SYMBOLIC LOOP
+        if not can_proceed_to_llm and len(valid_blockers) > 0:
+             print("\n       Skipping LLM: Blockers exist but are not updatable.")
+             return True, {package: current_version}, None
+
+        print("\n       Greedy Heuristic exhausted.")
+        
         current_versions_map = {}
         with open(baseline_reqs_path, 'r') as f:
             for line in f:
@@ -462,18 +565,14 @@ class DependencyAgent:
                     v_part = line.split('==')[1].split(';')[0].strip()
                     current_versions_map[p_name] = v_part
 
-        history = []
-        history.append((str(greedy_plan), "Greedy update failed validation."))
+        history = greedy_history_log 
 
         for attempt in range(1, 4):
-            print(f"\n    -> [Co-Resolution Attempt {attempt}/3] Requesting Expert Plan...")
-            
-            # Pass the Best Error Log for the first attempt, then use history
-            current_error_log = best_error_log if attempt == 1 else "Previous plan failed"
+            print(f"\n    -> [LLM Refinement Attempt {attempt}/3] Requesting Expert Plan...")
             
             co_resolution_plan = self.expert.propose_co_resolution(
                 target_package=package, 
-                error_log=current_error_log, 
+                error_log=best_error_log if attempt == 1 else history[-1][1], 
                 available_updates=updatable_blockers,
                 current_versions=current_versions_map,
                 history=history
@@ -486,30 +585,31 @@ class DependencyAgent:
             plan_list = co_resolution_plan['proposed_plan']
             print(f"    -> Executing Plan: {plan_list}")
             
-            probe_success = self._run_co_resolution_probe(plan_list, baseline_reqs_path)
+            probe_success, probe_stderr = self._run_co_resolution_probe(plan_list, baseline_reqs_path)
 
             if probe_success:
                  print("--> Co-resolution probe SUCCEEDED!")
+                 changes_map = {self._get_package_name_from_spec(p.split('==')[0]): p.split('==')[1] for p in plan_list}
+                 
                  with open(progressive_baseline_path, "r") as f: temp_lines = f.readlines()
                  with open(progressive_baseline_path, "w") as f:
-                     updated_pkgs = {self._get_package_name_from_spec(p.split('==')[0]): p.split('==')[1] for p in plan_list}
                      for line in temp_lines:
                          p_name = self._get_package_name_from_spec(line.split('==')[0] if '==' in line else "")
-                         if p_name in updated_pkgs:
-                             f.write(f"{p_name}=={updated_pkgs[p_name]}\n")
+                         if p_name in changes_map:
+                             f.write(f"{p_name}=={changes_map[p_name]}\n")
                          else:
                              f.write(line)
-                 return True, target_version, None
+                 return True, changes_map, None
             
             history.append((str(plan_list), "Validation Failed"))
 
-        print(f"--> Healing Result: All attempts failed. Reverting to {current_version}.")
-        return True, current_version, None
-        
+        print(f"--> Healing Result: All attempts failed. Reverting.")
+        return True, {package: current_version}, None
+    
     def _heal_with_filter_and_scan(self, package, last_good_version, failed_version, baseline_reqs_path):
         start_group(f"Healing '{package}': Filter-Then-Scan Strategy")
         
-        last_stderr = ""  # <--- Store the error log for the Expert Agent
+        last_stderr = "" 
 
         print("\n--- Phase 1: Filtering for compatible versions ---")
         candidate_versions = self.get_all_versions_between(package, last_good_version, failed_version)
@@ -534,8 +634,12 @@ class DependencyAgent:
             print(f"  -> Checking compatibility of {package}=={version}...")
             requirements_list_for_check = fixed_constraints + [f"{package}=={version}"]
             
-            # FIXED: Added --no-build-isolation to avoid legacy build failures
-            pip_command = [python_executable, "-m", "pip", "install", "--no-build-isolation", "--dry-run"] + requirements_list_for_check
+            pip_command = [
+                python_executable, "-m", "pip", "install", 
+                "--no-build-isolation", 
+                "--no-cache-dir", 
+                "--dry-run"
+            ] + requirements_list_for_check
             
             _, stderr, returncode = run_command(pip_command, display_command=False)
 
@@ -543,7 +647,7 @@ class DependencyAgent:
                 print(f"     -- Compatible.")
                 installable_versions.append(version)
             else:
-                last_stderr = stderr  # <--- Capture the rich error log
+                last_stderr = stderr
                 summary = self._get_error_summary(stderr)
                 print(f"     -- Incompatible. Diagnosis: {summary}")
         
@@ -564,7 +668,7 @@ class DependencyAgent:
             if success:
                 print(f"\nSUCCESS: Found latest working version: {package}=={version_to_test}")
                 end_group()
-                return version_to_test, "" # Success = empty error log
+                return version_to_test, ""
         
         print("\nResult: No compatible version passed validation. Reverting to last known good version.")
         end_group()
@@ -607,7 +711,7 @@ class DependencyAgent:
                     continue
         return available_updates
 
-    def _run_co_resolution_probe(self, proposed_plan: list, baseline_reqs_path: Path) -> bool:
+    def _run_co_resolution_probe(self, proposed_plan: list, baseline_reqs_path: Path) -> tuple[bool, str]:
         start_group(f"Co-Resolution Probe: Testing plan {proposed_plan}")
         
         venv_dir = Path("./temp_co_res_venv")
@@ -629,8 +733,12 @@ class DependencyAgent:
         
         requirements_list.extend(proposed_plan)
         
-        # FIXED: Added --no-build-isolation
-        pip_command_tools = [python_executable, "-m", "pip", "install", "--no-build-isolation"] + requirements_list
+        pip_command_tools = [
+            python_executable, "-m", "pip", "install", 
+            "--no-build-isolation", 
+            "--no-cache-dir"
+        ] + requirements_list
+        
         _, stderr_install, returncode = run_command(pip_command_tools, cwd=project_dir)
         
         if returncode != 0:
@@ -638,54 +746,28 @@ class DependencyAgent:
             summary = self.expert.summarize_error(stderr_install)
             print(f"    Diagnosis: {summary}")
             end_group()
-            return False
+            return False, stderr_install
 
-        print("\n--> Stage 2: Building and installing the project...")
-        # FIXED: Added --no-build-isolation
-        build_install_command = [python_executable, "-m", "pip", "install", "--no-build-isolation", f"./{project_dir}"]
-        _, stderr_build, returncode_build = run_command(build_install_command, cwd=project_dir)
-        if returncode_build != 0:
-            print("--> ERROR: Project build/install failed with the co-resolution set.")
-            end_group()
-            return False
+        if self.config.get("IS_INSTALLABLE_PACKAGE", False):
+            print("\n--> Stage 2: Building and installing the project...")
+            project_extras = self.config.get("PROJECT_EXTRAS", "")
+            build_install_command = [python_executable, "-m", "pip", "install", "--no-build-isolation", f"./{project_dir}{project_extras}"]
+            _, stderr_build, returncode_build = run_command(build_install_command, cwd=project_dir)
+            if returncode_build != 0:
+                print("--> ERROR: Project build/install failed with the co-resolution set.")
+                end_group()
+                return False, stderr_build
+        else:
+            print("\n--> Stage 2: Skipped (Project is not an installable package).")
 
         print("\n--> Stage 3: Running validation suite on the co-resolution set...")
-        success, _, _ = validate_changes(python_executable, self.config, group_title="Validating Co-Resolution Plan")
+        success, _, val_output = validate_changes(python_executable, self.config, group_title="Validating Co-Resolution Plan")
         
         if not success:
             print("--> ERROR: Validation failed for the co-resolution set.")
             end_group()
-            return False
+            return False, val_output
 
         print("--> SUCCESS: The co-resolution plan is provably working.")
         end_group()
-        return True
-    
-    def _unpin_and_bootstrap(self):
-        """
-        The definitive repair strategy: takes a broken requirements file,
-        unpins it, and calls bootstrap in 'Fallback Mode'.
-        """
-        start_group("REPAIR MODE: stripping all version constraints")
-        
-        print("--> Step 1: Extracting package names from broken requirements file...")
-        package_names = []
-        with open(self.requirements_path, 'r') as f_read:
-            for line in f_read:
-                # Keep the editable install line as-is
-                if line.strip().startswith('-e'):
-                    package_names.append(line.strip())
-                else:
-                    pkg_name = self._get_package_name_from_spec(line)
-                    if pkg_name:
-                        package_names.append(pkg_name)
-        
-        print(f"--> Step 2: Overwriting '{self.requirements_path.name}' with unpinned packages.")
-        with open(self.requirements_path, 'w') as f_write:
-            f_write.write("\n".join(sorted(package_names)))
-
-        print("\n--> Step 3: Retrying bootstrap with clean slate...")
-        end_group()
-        
-        # Call with is_fallback_attempt=True to enforce the 1-try limit
-        self._bootstrap_unpinned_requirements(is_fallback_attempt=True)
+        return True, ""
