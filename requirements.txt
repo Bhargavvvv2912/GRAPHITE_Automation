@@ -44,7 +44,7 @@ six==1.17.0
 sympy==1.14.0
 torch==2.9.1
 torchvision==0.24.1
-tqdm==4.67.2
+tqdm==4.67.3
 triton==3.5.1
 typing_extensions==4.15.0
 tzdata==2025.3
